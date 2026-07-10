@@ -1,1 +1,24 @@
+# Rust build artifacts
 /target
+
+# Cargo.lock — ignore for libraries (this crate is `--lib`), since consumers
+# pin their own versions. If you ever ship a binary from this repo, commit
+# Cargo.lock instead.
+Cargo.lock
+
+# fastembed downloads the ONNX model + tokenizer files on first run and
+# caches them locally — don't want a ~100MB model checked into git
+.fastembed_cache/
+
+# SQLite database files created by MemoryEngine::open() during dev/testing
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Editor/OS cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp
