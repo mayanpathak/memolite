@@ -5,10 +5,19 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
 anyhow = "1"
 thiserror = "2"
+
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Local embedding generation (ONNX)
+fastembed = "5"
+
+bincode = "1.3"
