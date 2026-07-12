@@ -1651,3 +1651,428 @@ v5's ordering guarantee, unchanged in spirit from v4 but now actually true throu
 code block, at every milestone, only calls functions and references fields that were fully defined
 at or before that point in this document — and this document never assumes anything about the
 codebase that wasn't independently verified against the real repository first.**
+
+
+
+#### SHORTCOMINGS OF THIS BUILDING PLAN ###
+
+V5 is the strongest plan so far, but it still is not fully executable as written. The central architecture is now mostly sound; the remaining problems are primarily milestone ordering, missing definitions, incomplete module wiring, and a few correctness gaps.
+
+I would rate it around 88% ready.
+
+No repository files were modified.
+
+## Compile blockers
+
+### 1. Step 0 changes `MemoryEngine` before replacing `open()`
+
+At [plan line 309](C:\Users\Mayan\.codex\attachments\88c8fdc9-75e8-4a81-9a50-7742be453400\pasted-text.txt:309), Step 0 changes the engine to:
+
+```rust
+pub struct MemoryEngine {
+    conn: Mutex<Connection>,
+    embedder: Mutex<Embedder>,
+    vector_store: RwLock<Arc<dyn VectorStore>>,
+    maintenance_running: Arc<AtomicBool>,
+}
+```
+
+But the compatible `open()` implementation is not introduced until M3.
+
+Immediately after changing the struct, the current [engine.rs](C:\Users\Mayan\Desktop\memolite\src\engine.rs:320) still has an `open()` that constructs:
+
+```rust
+Self {
+    conn,
+    embedder: Mutex::new(embedder),
+}
+```
+
+That no longer matches the struct. Therefore Step 0’s claimed checkpoint cannot pass:
+
+```text
+cargo build && cargo test green
+```
+
+Move Step 3.1’s `open()` implementation into Step 0.5, or delay changing `MemoryEngine` until M3.
+
+### 2. `InvalidConfidence` is referenced but never defined
+
+At [plan line 993](C:\Users\Mayan\.codex\attachments\88c8fdc9-75e8-4a81-9a50-7742be453400\pasted-text.txt:993):
+
+```rust
+pub fn parse_str(s: &str) -> Result<Self, InvalidConfidence>
+```
+
+But V5 never defines `InvalidConfidence`.
+
+Add:
+
+```rust
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid confidence value: {0}")]
+pub struct InvalidConfidence(pub String);
+```
+
+Also explicitly import:
+
+```rust
+use serde::{Deserialize, Serialize};
+```
+
+When parsing confidence inside `row_to_memory`, convert this error into `rusqlite::Error::FromSqlConversionFailure`, matching the existing memory-type conversion pattern.
+
+### 3. New modules are not actually registered
+
+The cross-reference says every module is registered, but the plan only explicitly registers `migrations` and mentions `streaming`.
+
+It does not clearly add all required module declarations:
+
+```rust
+pub mod vector_store;
+pub mod recall;
+pub mod ranking;
+pub mod requests;
+pub mod confidence;
+pub mod compression;
+pub mod streaming;
+pub mod maintenance;
+
+#[cfg(feature = "generic-http")]
+pub mod generic_http;
+```
+
+Nor does it define the corresponding public exports consistently.
+
+Add one exact `lib.rs` block and update it in the milestone where each public type becomes available.
+
+## The plan is still not fully self-contained
+
+### 4. M8 contains no implementation
+
+M8 only describes `StreamIngestor`, cancellation behavior, `SentenceBuffer`, reports and tests. It does not provide the actual types or methods.
+
+Missing concrete definitions include:
+
+```rust
+pub struct IngestChunk
+pub struct IngestReport
+pub struct StreamIngestor
+pub struct SentenceBuffer
+StreamIngestor::spawn
+StreamIngestor::sender
+StreamIngestor::shutdown_now
+StreamIngestor::finish
+SentenceBuffer::feed
+SentenceBuffer::finish
+```
+
+A developer cannot implement M8 from V5 alone.
+
+### 5. Compression contains unresolved missing functions and types
+
+M9 calls:
+
+```rust
+self.get_episodic_memories_older_than(14)?
+compression::greedy_cluster(...)
+compression::summarize_cluster(...)
+```
+
+but V5 does not define these implementations or their supporting types:
+
+```rust
+Cluster
+CompressionResult
+COMPRESSION_ALGORITHM_VERSION
+MAX_SUMMARY_CHARS
+```
+
+The plan also does not provide the complete `compression.rs` module or its registration.
+
+### 6. `MemoryStats` and `stats()` disappeared
+
+Earlier plans included an observable statistics API. V5 neither implements it nor explicitly removes it from project scope.
+
+Choose one:
+
+- Add a complete `MemoryStats` definition and `stats()`.
+- Explicitly state it has been removed from the final project requirements.
+
+## Correctness faults
+
+### 7. `InMemoryVectorStore::search()` does not validate the query
+
+The implementation validates inserted/replacement vectors, but `search()` accepts any query length and any non-finite values.
+
+Because cosine uses `zip`, a wrong-length query is silently truncated rather than rejected.
+
+Add before reading the map:
+
+```rust
+if query.len() != self.dim {
+    return Err(MemoliteError::VectorStore(format!(
+        "query has dimension {}, expected {}",
+        query.len(),
+        self.dim
+    )));
+}
+
+if !query.iter().all(|x| x.is_finite()) {
+    return Err(MemoliteError::VectorStore(
+        "query contains non-finite values".into(),
+    ));
+}
+```
+
+`insert()` should also reject non-finite vectors, not only `replace_all()`.
+
+### 8. `forget()` validates the UUID after deleting SQLite
+
+It currently performs the database deletion and only then does:
+
+```rust
+let uuid = Uuid::parse_str(id)?;
+```
+
+Validate first:
+
+```rust
+let uuid = Uuid::parse_str(id)?;
+```
+
+Then mutate SQLite.
+
+This also forces a public API decision: previously, forgetting a nonexistent arbitrary string was effectively idempotent. V5 changes malformed IDs into errors. That change should be documented and tested.
+
+### 9. M4 reintroduces pre-increment result values
+
+M3 correctly refetches memories after incrementing access statistics. M4’s `recall_query()` constructs `RecallItem`s, then increments the database afterward:
+
+```rust
+for item in &scored {
+    self.update_access_stats(item.memory.id)?;
+}
+
+Ok(RecallResult { items: scored })
+```
+
+The returned `Memory` values again contain the old `access_count` and `last_accessed`.
+
+Choose one consistent behavior:
+
+- Update/refetch every final result before returning.
+- Mutate the in-memory items after the SQL update.
+- Explicitly document that recall results represent pre-access state.
+
+The existing direction established in M3 suggests refetching or mutating to post-access state.
+
+### 10. M6 leaves conflicting access-stat helpers
+
+M4’s `recall()` delegates to `recall_query()`. M6 replaces the `recall_query()` call with the promotion-aware helper, so the old `update_access_stats()` helper is no longer needed.
+
+The plan incorrectly says the M3 plain recall path still uses it, even though that body was replaced in M4.
+
+Remove the obsolete helper in M6 or Clippy may report it as dead code.
+
+### 11. Compression silently skips missing embeddings
+
+M9 does:
+
+```rust
+if let Some(v) = self.get_embedding(...).await? {
+    with_vectors.push(...);
+}
+```
+
+A missing embedding makes a candidate silently disappear from compression. Earlier plans correctly required this to fail loudly.
+
+Use:
+
+```rust
+let vector = self
+    .get_embedding(&id.to_string())
+    .await?
+    .ok_or_else(|| MemoliteError::VectorStore(
+        format!("memory {id} has no persisted embedding")
+    ))?;
+```
+
+Also validate dimension and finiteness before clustering. Validation inside `replace_all()` does not protect the clustering path because compression does not call `replace_all()` before clustering.
+
+### 12. `resync_vector_index()` accepts missing embeddings silently
+
+The inner join:
+
+```sql
+FROM memories m
+JOIN embeddings e ON e.memory_id = m.id
+```
+
+omits memory rows without embeddings. `replace_all()` then makes the vector index “exactly” match only the join result, not all memories.
+
+Either:
+
+- Treat memories without embeddings as database corruption and fail `open()`.
+- Regenerate their embeddings.
+- Explicitly document that embedding-less memories are allowed but never recallable.
+
+For the project’s current design, failing loudly is the safest policy. Use a `LEFT JOIN` plus a missing-embedding check or compare row counts.
+
+### 13. Remote opening destructively replaces the entire remote index
+
+`open_with_store_internal()` always calls:
+
+```rust
+resync_vector_index(...);
+```
+
+which calls remote `replace_all()`.
+
+Opening a local database against a shared remote endpoint will delete every vector not represented in that local SQLite database.
+
+Add an explicit policy:
+
+```rust
+pub enum BackfillPolicy {
+    ExistingOnly,
+    UpsertLocal,
+    ReplaceAll,
+}
+```
+
+Or clearly require that every remote vector-store endpoint/collection is exclusively dedicated to one Memolite database.
+
+Silently issuing destructive `replace_all` during `open_with_store()` is too dangerous.
+
+### 14. `replace_all()` on the HTTP backend lacks finite-value validation
+
+It validates dimensions, but not NaN/infinity.
+
+Add:
+
+```rust
+if !e.vector.iter().all(|x| x.is_finite()) {
+    return Err(MemoliteError::VectorStore(format!(
+        "entry for {} contains a non-finite value",
+        e.id
+    )));
+}
+```
+
+The same applies to HTTP `insert()`.
+
+## Migration concerns
+
+### 15. Confidence is not recorded as migration version 2
+
+The confidence repair runs separately but the schema migration table still records only version 1.
+
+That makes the version table an incomplete representation of schema history.
+
+Prefer:
+
+```text
+1 = baseline memories/embeddings
+2 = confidence column
+```
+
+Run migration 2 transactionally and record it with `INSERT OR IGNORE`.
+
+A repair check can still run defensively, but migration history should describe the real schema.
+
+### 16. `row_to_memory` transition needs an exact implementation
+
+When confidence is added, V5 says to add the field and extend `MEMORY_COLUMNS`, but does not provide the updated decoder.
+
+The exact addition should include:
+
+```rust
+let confidence_str: String = row.get(10)?;
+let confidence = ConfidenceLevel::parse_str(&confidence_str)
+    .map_err(|e| to_sql_conversion_err(10, e))?;
+```
+
+and:
+
+```rust
+confidence,
+```
+
+inside the returned `Memory`.
+
+Every explicit `SELECT` used after M6 must use the updated 11-column constant.
+
+## Benchmark/release gap
+
+### 17. The plan still has no benchmark implementation
+
+You previously stated the finished project should pass:
+
+```text
+cargo test
+cargo bench
+cargo clippy
+cargo fmt
+```
+
+V5 contains no benchmark target, Criterion dependency, benchmark dataset, or `cargo bench` release check.
+
+Add:
+
+```toml
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "memolite_bench"
+harness = false
+```
+
+Suggested benchmarks:
+
+- In-memory vector search at 1k, 10k and 100k vectors.
+- SQLite `get()`.
+- Store without model-load time.
+- Recall at 1k and 10k memories.
+- Index resynchronization.
+- Compression candidate clustering.
+
+Then include:
+
+```powershell
+cargo bench
+```
+
+in final validation.
+
+## Verdict
+
+V5 successfully fixes most V4 root causes:
+
+- Correct Working TTL.
+- `replace_all()` provides a real reconciliation primitive.
+- Rebuild preserves the configured backend.
+- Expired and superseded rows remain indexable.
+- The remote backend is publicly reachable.
+- Temporal naming is honest.
+- Dependencies are centralized.
+- Expiry handling is materially better.
+
+However, it still has three direct execution blockers:
+
+1. Step 0 changes `MemoryEngine` before providing its compatible `open()`.
+2. `InvalidConfidence` is undefined.
+3. M8/M9 are not actually self-contained implementations.
+
+It also needs a safer remote-backfill policy and a real benchmark milestone.
+
+My rating:
+
+- Architecture: 9/10
+- Persistence design: 8.5/10
+- Compile readiness by checkpoint: 8/10
+- Self-containedness: 7/10
+- Fully executable as written: not yet
+
+This is now close enough that one disciplined correction pass should be sufficient; the remaining issues are concrete rather than foundational.

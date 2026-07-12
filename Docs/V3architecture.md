@@ -1893,3 +1893,416 @@ v3 is checked against the real `mayanpathak/memolite` repo (re-cloned and re-ver
 writing this document: `engine.rs` still has the plain `Connection`/`Mutex<Embedder>` struct and a
 `todo!()` `recall()`; `error.rs` still lacks the new variants). It should compile incrementally at
 every checkpoint, and none of the 17 findings from the v2 review remain open.
+
+
+#### SHORTCOMINGS OF THIS BUILDING PLAN ###
+
+V3 is significantly improved, but it is still not properly executable milestone-by-milestone. Several sequencing errors cause intermediate checkpoints not to compile, and the advertised “atomic” index rebuild is not actually atomic.
+
+No repository files were modified.
+
+## Critical blockers
+
+### 1. M3 calls functionality that is not created until later milestones
+
+M3’s `open()` is instructed to call:
+
+```rust
+run_migrations(&mut conn)?;
+```
+
+But `run_migrations()` is not introduced until M6, after M3 and M4.
+
+M3’s `forget()` similarly calls:
+
+```rust
+self.rebuild_active_vector_index().await
+```
+
+but that method is not introduced until M9.
+
+Therefore the M3 checkpoint cannot compile as written.
+
+Required fix: move the following into Step 0 or M3:
+
+- The baseline migration runner needed by `open()`.
+- `rebuild_active_vector_index()` or a simpler M3 reconciliation helper.
+
+M6 can later add migration 2 for confidence, but the migration infrastructure itself must exist before M3.
+
+### 2. M4 accesses confidence before confidence exists
+
+At [plan line 517](C:\Users\Mayan\.codex\attachments\b5151b9d-39da-477d-b270-834e38dc442c\pasted-text.txt:517), M4 uses:
+
+```rust
+let confidence_weight = memory.confidence.weight();
+```
+
+`Memory.confidence` is not added until M6. The comment saying “1.0 until M6 lands” does not match the code.
+
+During M4 use:
+
+```rust
+let confidence_weight = 1.0;
+```
+
+Then Step 76 must replace it with:
+
+```rust
+let confidence_weight = memory.confidence.weight();
+```
+
+M4 also calls:
+
+```rust
+self.update_access_stats_and_maybe_promote(...)
+```
+
+which does not exist until M6. Before M6 it must call the Step 47 helper:
+
+```rust
+self.update_access_stats(...)
+```
+
+and M6 should replace that call.
+
+### 3. M3 test 51 cannot pass
+
+The Step 46 `recall()` implementation never calls `update_access_stats()`, yet test 51 requires `access_count` to increase.
+
+Add inside the final result loop:
+
+```rust
+self.update_access_stats(mem.id)?;
+```
+
+This will later be replaced by the M6 promotion helper.
+
+### 4. `include_expired` and `include_superseded` cannot work
+
+Restart backfill indexes only:
+
+```sql
+WHERE m.superseded_by IS NULL
+  AND (m.expires_at IS NULL OR m.expires_at >= ?1)
+```
+
+Compression also deletes superseded vectors from the vector store.
+
+But `RecallQuery` advertises:
+
+```rust
+include_expired
+include_superseded
+```
+
+Filtering can only remove vector candidates; it cannot recover rows that were never indexed.
+
+Choose one design:
+
+- Recommended: keep all non-deleted memories in the vector index, including expired and superseded records, and exclude them through default recall filters.
+- Alternative: when either include flag is enabled, retrieve stored embeddings directly from SQLite and score them outside the live vector index.
+- Simplest: remove the include flags and related tests.
+
+Without one of these changes, both options are misleading and their tests will fail after restart/compression.
+
+### 5. The claimed atomic index rebuild is still clear-then-insert
+
+At [plan line 1366](C:\Users\Mayan\.codex\attachments\b5151b9d-39da-477d-b270-834e38dc442c\pasted-text.txt:1366), the plan builds a temporary `InMemoryVectorStore`, but never swaps it into the engine. It then performs:
+
+```rust
+self.vector_store.clear().await?;
+
+for mem in &active {
+    self.vector_store.insert(...).await?;
+}
+```
+
+That is exactly the non-atomic clear-then-loop operation v3 claims to have fixed. If any insertion fails, the live index is partial.
+
+A genuine solution requires one of:
+
+```rust
+async fn replace_all(&self, entries: Vec<VectorEntry>) -> Result<()>;
+```
+
+with an atomic in-memory implementation; or:
+
+```rust
+vector_store: RwLock<Arc<dyn VectorStore>>
+```
+
+so a fully constructed replacement backend can be swapped into the engine in one lock operation.
+
+For remote stores, document `replace_all` as backend-dependent or use generation/namespace swapping.
+
+### 6. M11 still contains `todo!()`
+
+The generic HTTP backend’s `search()` is:
+
+```rust
+todo!("wire against the pinned/generic contract's actual response shape")
+```
+
+That compiles but panics during its required integration test. Therefore this claim cannot be true:
+
+> `--all-features` passes either way.
+
+The generic HTTP contract must specify and implement its response:
+
+```json
+[
+  { "id": "uuid", "score": 0.91 }
+]
+```
+
+Then deserialize, validate UUIDs and finite scores, sort if required, and return `VectorHit`s.
+
+## Concurrency faults after M6.5
+
+### 7. Later snippets still call methods directly on `Mutex<Connection>`
+
+M6.5 changes:
+
+```rust
+conn: Mutex<Connection>
+```
+
+But M9 and other later code still uses:
+
+```rust
+self.conn.prepare(...)
+self.conn.query_row(...)
+self.conn.execute(...)
+self.conn.unchecked_transaction(...)
+```
+
+Those methods do not exist on `Mutex<Connection>`.
+
+Every post-M6.5 helper must use a scoped guard:
+
+```rust
+let conn = self.conn
+    .lock()
+    .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+
+let mut stmt = conn.prepare(...)?;
+```
+
+For transactions:
+
+```rust
+let mut conn = self.conn
+    .lock()
+    .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+
+let tx = conn.transaction()?;
+```
+
+The guard must be dropped before any vector-store `.await`.
+
+### 8. Backfill holds SQLite statement state across `.await`
+
+`backfill_active_vectors()` iterates `rusqlite::Rows` and awaits `store.insert()` inside the iteration. This retains the statement/connection borrow across an await and can make the future non-`Send`.
+
+Read and decode everything first:
+
+```rust
+let entries: Vec<(Uuid, Vec<f32>, HashMap<String, Value>)> = {
+    // prepare/query/collect synchronously
+};
+
+for (id, vector, metadata) in entries {
+    store.insert(id, &vector, metadata).await?;
+}
+```
+
+This also becomes necessary once the connection is mutex-protected.
+
+## API/data-model faults
+
+### 9. Permanent expiry cannot be preserved during update
+
+The plan says that if an old memory has `expires_at == None`, its replacement should also have no expiry.
+
+But:
+
+```rust
+request.custom_ttl = None;
+```
+
+means “use the memory type’s default TTL,” not “permanent.” Test 98 therefore cannot pass.
+
+An `Option<Duration>` cannot represent all three states:
+
+1. Use type default.
+2. Use custom TTL.
+3. Never expire.
+
+Introduce:
+
+```rust
+pub enum ExpiryPolicy {
+    TypeDefault,
+    Custom(chrono::Duration),
+    Never,
+}
+```
+
+Store it in `StoreRequest`, and use `Option<ExpiryPolicy>` in `MemoryUpdate` where `None` means preserve the original policy.
+
+### 10. UUID fallback can delete the wrong vector
+
+The update code does:
+
+```rust
+let new_uuid = Uuid::parse_str(&new_id).unwrap_or(uuid);
+```
+
+If parsing fails, `uuid` is the old memory’s ID. Compensation could delete the original memory’s vector instead of the replacement’s vector.
+
+Never fall back to a different ID. Return a typed UUID error, or change the internal store pipeline to return `Uuid`:
+
+```rust
+async fn store_request_internal(...) -> Result<Uuid>;
+```
+
+The public `store()` can convert the final UUID to `String`.
+
+Compression has a similar bad fallback:
+
+```rust
+Uuid::parse_str(&new_id).unwrap_or_else(|_| Uuid::new_v4())
+```
+
+That creates an unrelated ID and makes compensation ineffective.
+
+### 11. `contains()` mishandles HTTP errors
+
+The generic adapter currently treats every status other than `200 OK` as `false`:
+
+```rust
+Ok(resp.status() == StatusCode::OK)
+```
+
+A `500`, `401`, or `429` is not “missing.”
+
+Use:
+
+```rust
+match resp.status() {
+    StatusCode::OK => Ok(true),
+    StatusCode::NOT_FOUND => Ok(false),
+    _ => Err(MemoliteError::VectorStore(
+        resp.error_for_status().unwrap_err().to_string()
+    )),
+}
+```
+
+### 12. `store_with_options()` remains incomplete pseudocode
+
+Step 90 contains comments for the most important persistence work:
+
+```rust
+// id, timestamps, metadata_json...
+// embed-before-write, single SQLite tx...
+```
+
+That is not a copy-pasteable implementation. Because the plan claims to be fully self-contained and executable, it must include:
+
+- Content and importance validation.
+- TTL/expiry calculation.
+- Metadata serialization.
+- Embedder locking.
+- Bincode serialization.
+- The complete memory insert.
+- The complete embedding insert.
+- Transaction commit.
+- Vector insertion and compensation.
+
+The same issue affects `open_with_store()`, `stats()`, greedy clustering, and parts of the temporal API.
+
+## Temporal-feature regression
+
+### 13. M7 removed previously promised temporal features
+
+V2 included:
+
+- `what_changed_since()`
+- `find_stale_memories()`
+- `RecallQuery.created_after`
+- `RecallQuery.created_before`
+- `RecallQuery.only_stale`
+
+V3 replaces these with `query_by_time_range()` and a superseded-chain walker. That may be a valid smaller scope, but it no longer implements the previously advertised temporal-querying feature set.
+
+Decide which API is actually part of the project and make M7 explicit. If those features remain required, restore them and their tests.
+
+## Maintenance and recovery issues
+
+### 14. Maintenance can remain permanently locked after a panic
+
+The plan intentionally leaves `maintenance_running = true` after a task panic. That means there is no recovery path other than reopening the entire engine.
+
+A better `MaintenanceHandle::shutdown()` should clear the flag after observing the join result, including a panic. Alternatively provide:
+
+```rust
+pub fn reset_maintenance_after_failure(&self) -> Result<()>;
+```
+
+Blocking silent restart after an unobserved panic is reasonable; blocking an explicit caller who observed and handled the failure is not.
+
+### 15. “Self-heals any partial schema” is overstated
+
+The migration runner repairs missing tables and the confidence column. It does not verify or repair:
+
+- Missing baseline columns.
+- Incorrect column types or constraints.
+- Broken foreign-key definitions.
+- Incorrect embedding schema.
+- Missing confidence constraints when the column already exists.
+
+Change the claim to “repairs missing expected tables and the confidence column,” or add complete schema verification.
+
+### 16. Compression summary expiry needs a deliberate policy
+
+Compressed summaries are stored as `Episodic`, so they receive the episodic default TTL. Originals remain superseded and excluded by default. When the summary expires or is purged, the consolidated information disappears from normal recall even though originals remain in SQLite.
+
+Choose an explicit policy:
+
+- Store compressed summaries as semantic memories.
+- Give summaries a longer/custom TTL.
+- Restore originals if their summary is purged.
+- Or document that compression intentionally allows eventual loss from active retrieval.
+
+## Verdict
+
+V3 fixes many v2 issues, especially:
+
+- Restart backfill.
+- Migration adoption checks.
+- Bounded prompt rendering.
+- Separate immediate/draining streaming shutdown.
+- Candidate caps and metadata filtering.
+- Maintenance interval validation.
+- Backend policy simplification.
+- Embedding dimension/finite checks.
+
+But the plan still has six direct execution blockers:
+
+1. M3 depends on M6 and M9 code.
+2. M4 depends on M6 fields/methods.
+3. M3 access-count test lacks the call it tests.
+4. Include-expired/superseded cannot work with the index policy.
+5. The “atomic rebuild” is not atomic.
+6. The optional backend still contains `todo!()`.
+
+My rating:
+
+- Architecture: 8.5/10
+- Feature design: 8/10
+- Compile readiness by milestone: 6.5/10
+- End-to-end executability: 7/10
+- Properly executable as written: no
+
+The plan is close conceptually, but it needs another correction pass focused on build-order independence and replacing remaining pseudocode with complete implementations.

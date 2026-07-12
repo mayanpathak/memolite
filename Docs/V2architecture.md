@@ -1790,3 +1790,481 @@ Confirm both new limitations are present and accurate:
 Everything above is now internally consistent: no milestone references a type, table, or module
 that a later milestone was going to create. Follow the **Corrected build order** table at the top,
 and every intermediate commit compiles and passes `cargo test`.
+
+
+
+
+#### SHORTCOMINGS OF THIS BUILDING PLAN ###
+
+
+No—the new plan is substantially better, but it is still not executable as written. Several snippets will not compile, and a few durability/concurrency guarantees are impossible with the described implementation.
+
+I reviewed the current codebase against the full 1,792-line plan. The most important faults are below, ordered by severity.
+
+## Critical compile/architecture faults
+
+1. Step 44 reintroduces an architecture that does not exist
+
+At [plan line 177](C:\Users\Mayan\.codex\attachments\3a7d9d75-d559-4385-8005-2710e4f176c6\pasted-text.txt:177), the plan replaces the real engine with:
+
+```rust
+pub struct MemoryEngine {
+    db: Db,
+    embedder: Embedder,
+    vector_store: Box<dyn VectorStore>,
+}
+```
+
+The actual engine has:
+
+```rust
+conn: Connection,
+embedder: Mutex<Embedder>,
+```
+
+There is no `Db` type or `src/db/` module. `Embedder::embed()` requires `&mut self`, so a plain `Embedder` cannot be called from the planned `&self` methods. Later sections also alternate between `Box<dyn VectorStore>` and the previously intended `Arc<dyn VectorStore>`.
+
+Required correction: preserve the actual flat architecture:
+
+```rust
+pub struct MemoryEngine {
+    conn: Mutex<Connection>,             // introduced before any concurrency
+    embedder: Mutex<Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+}
+```
+
+Every `self.db.*` instruction must become a private `MemoryEngine` helper using `self.conn`, unless the plan explicitly adds and completes a real `Db` refactor first.
+
+2. The plan references `src/db/queries.rs` throughout but never creates a `db` module
+
+Examples include Steps 48, 73, 75, 79, 107, 147 and 150. This directly contradicts both the codebase and the plan’s own claim that migrations stay in `engine.rs`.
+
+Pick exactly one strategy:
+
+- Recommended: keep SQL helpers inside `engine.rs`.
+- Alternative: introduce `src/db/mod.rs`, `schema.rs`, and `queries.rs` as a complete preliminary refactor, update `lib.rs`, and move all existing SQL there.
+
+The current mixture cannot compile.
+
+3. Missing error variants
+
+The plan uses all of these:
+
+```rust
+MemoliteError::InvalidArgument(...)
+MemoliteError::Serialization(...)
+MemoliteError::Internal(...)
+MemoliteError::VectorStore(...)
+```
+
+None exists in the current [error.rs](C:\Users\Mayan\Desktop\memolite\src\error.rs). The plan never provides a definitive step adding them.
+
+Add before M3:
+
+```rust
+#[error("invalid argument: {0}")]
+InvalidArgument(String),
+
+#[error("vector store error: {0}")]
+VectorStore(String),
+
+#[error("internal error: {0}")]
+Internal(String),
+```
+
+A separate `Serialization` variant is unnecessary because the existing `InvalidMetadata(#[from] serde_json::Error)` can handle metadata serialization:
+
+```rust
+let metadata_json = serde_json::to_string(&request.metadata)?;
+```
+
+4. Step 41 does not export `InMemoryVectorStore`
+
+It declares the module but only exports `VectorStore` and `VectorHit` from `lib.rs`.
+
+Add to `src/vector_store/mod.rs`:
+
+```rust
+pub use in_memory::InMemoryVectorStore;
+```
+
+Also register `math_utils` in `lib.rs`:
+
+```rust
+pub mod math_utils;
+```
+
+5. M3 still contains panic paths and no dimension validation
+
+At [plan line 100](C:\Users\Mayan\.codex\attachments\3a7d9d75-d559-4385-8005-2710e4f176c6\pasted-text.txt:100):
+
+```rust
+self.data.write().unwrap()
+b.score.partial_cmp(&a.score).unwrap()
+```
+
+These violate the plan’s stated requirements. NaN similarity can make `partial_cmp()` return `None`.
+
+Use lock-error mapping and total ordering:
+
+```rust
+let mut guard = self.data.write()
+    .map_err(|_| MemoliteError::VectorStore("vector-store lock poisoned".into()))?;
+
+scored.sort_by(|a, b| {
+    b.score.total_cmp(&a.score)
+        .then_with(|| a.id.cmp(&b.id))
+});
+```
+
+Both `insert()` and `search()` must reject vectors whose length differs from `self.dim`.
+
+6. The plan claims cross-system atomicity that SQLite cannot provide
+
+At Steps 45 and 87 it says SQLite rows and an async vector-store insertion happen in one transaction. A SQLite transaction cannot atomically include an in-memory or remote vector backend.
+
+The correct pipeline is:
+
+1. Validate request.
+2. Generate and serialize embedding.
+3. Commit memory and embedding rows in one SQLite transaction.
+4. Insert into vector store after releasing the connection lock.
+5. If vector insertion fails, compensate by deleting the new SQLite memory and embedding.
+6. Return the original vector-store error, augmented if compensation also fails.
+
+Never hold a `MutexGuard<Connection>` across `.await`.
+
+7. The migration runner does not implement its promised adoption logic
+
+At [plan line 507](C:\Users\Mayan\.codex\attachments\3a7d9d75-d559-4385-8005-2710e4f176c6\pasted-text.txt:507), the prose says it uses `pragma_table_info`, but the code only checks whether `memories` exists.
+
+Problems:
+
+- If `memories` exists but `embeddings` does not, migration 1 is recorded without creating it.
+- If `confidence` already exists but `schema_migrations` does not, migration 2 attempts to add it again and fails.
+- It records migration 1 merely because one table exists.
+- Migration ownership conflicts with the existing unconditional `CREATE TABLE IF NOT EXISTS` in `open()`.
+
+Required correction: `open()` must enable foreign keys and call the migration runner instead of separately creating schema. Adoption must inspect both tables and the confidence column individually.
+
+8. Explicit SQL column order does not match `row_to_memory`
+
+The planned SQL uses:
+
+```sql
+id, content, type, importance, created_at, last_accessed,
+access_count, expires_at, superseded_by, metadata, confidence
+```
+
+The actual decoder expects:
+
+```text
+id, content, type, importance, access_count, created_at,
+last_accessed, expires_at, superseded_by, metadata
+```
+
+That will decode timestamps as access counts and vice versa.
+
+Define one constant and use it everywhere:
+
+```rust
+const MEMORY_COLUMNS: &str =
+    "id, content, type, importance, access_count, created_at,
+     last_accessed, expires_at, superseded_by, metadata, confidence";
+```
+
+## M5/M6 faults
+
+9. `old.custom_ttl` does not exist
+
+At [plan line 744](C:\Users\Mayan\.codex\attachments\3a7d9d75-d559-4385-8005-2710e4f176c6\pasted-text.txt:744):
+
+```rust
+request.custom_ttl = update.new_ttl.or(old.custom_ttl);
+```
+
+`Memory` has `expires_at`, not `custom_ttl`.
+
+The plan must choose update expiry semantics. A defensible rule is:
+
+```rust
+request.custom_ttl = update.new_ttl.or_else(|| {
+    old.expires_at
+        .map(|expiry| expiry.signed_duration_since(Utc::now()))
+        .filter(|ttl| *ttl > chrono::Duration::zero())
+});
+```
+
+Alternatively, explicitly reset replacement memories to the selected type’s default TTL. The behavior must be documented and tested.
+
+10. Confidence behavior contradicts itself
+
+The update implementation defaults a replacement to `Inferred`, but test Step 97 says a content-only update leaves confidence unchanged “unless confidence defaults to Inferred.”
+
+That is not a testable specification. Choose one:
+
+- Recommended: replacements default to `Inferred`, unless explicitly overridden.
+- Or preserve the original confidence.
+
+Then write the test with one exact expected value.
+
+11. UUID/String mismatches remain
+
+`Memory.id` is `Uuid`, while many planned helpers expect `&str` or `String`.
+
+Examples:
+
+```rust
+self.db.find_superseded_original_id(&mem.id)
+memories.iter().map(|m| m.id.clone()).collect::<Vec<String>>()
+cluster.member_ids.contains(&m.id)
+```
+
+These do not compile.
+
+Use either `Uuid` internally everywhere or convert explicitly:
+
+```rust
+mem.id.to_string()
+cluster.member_ids.contains(&m.id.to_string())
+```
+
+Using `Uuid` for `Cluster.member_ids`, `ChangeRecord.old_id`, and public-facing identifiers would be cleaner.
+
+## Concurrency and streaming faults
+
+12. The concurrency refactor removes the necessary embedder mutex
+
+At [plan line 948](C:\Users\Mayan\.codex\attachments\3a7d9d75-d559-4385-8005-2710e4f176c6\pasted-text.txt:948), the proposed engine contains:
+
+```rust
+embedder: Embedder
+```
+
+That breaks `store(&self)` and `recall(&self)` because `embed()` takes `&mut self`.
+
+It must remain:
+
+```rust
+embedder: Mutex<Embedder>
+```
+
+13. `StreamIngestor::shutdown()` can hang forever
+
+Dropping the ingestor’s original sender does not close the channel if callers still hold clones returned by `sender()`. In that case:
+
+```rust
+self.handle.await
+```
+
+waits indefinitely.
+
+The API must either:
+
+- Document that all cloned senders must be dropped before shutdown and return a timeout/cancellation mechanism; or
+- Give the task an explicit cancellation token and define whether shutdown drains or discards queued messages.
+
+Also replace:
+
+```rust
+expect("sender available until shutdown")
+```
+
+with a fallible return.
+
+14. `accepted` is actually “received,” not “accepted”
+
+The counter increments only when the worker receives a message. Sends that are accepted into the channel but not processed before cancellation are not counted. Rename it to `received`, or define counters at send time.
+
+15. The streaming failure test requires dependency injection that is not planned
+
+Step 141 says to mock a `store_with_options` failure, but `StreamIngestor` is hard-coded to `Arc<MemoryEngine>`. There is no trait or injectable storage function.
+
+Either:
+
+- Introduce a small ingestion-target trait and test with a fake; or
+- Trigger a real validation failure, such as whitespace content or invalid importance.
+
+## Compression faults
+
+16. `get_embeddings()` silently discards database and decode errors
+
+At [plan line 1181](C:\Users\Mayan\.codex\attachments\3a7d9d75-d559-4385-8005-2710e4f176c6\pasted-text.txt:1181):
+
+```rust
+if let Ok(bytes) = stmt.query_row(...) {
+    out.push((id.clone(), bytes_to_vec_f32(&bytes)));
+}
+```
+
+Problems:
+
+- Missing embeddings are silently ignored.
+- Corrupt blobs are silently ignored or fail to compile depending on `bytes_to_vec_f32`.
+- `bytes_to_vec_f32` is never defined.
+- Stored vectors use `bincode`, so decoding must use `bincode::deserialize`.
+
+Return errors except for an explicitly handled `QueryReturnedNoRows`.
+
+17. Summary size accounting is incorrect
+
+`MAX_SUMMARY_CHARS` only limits `joined`; the fixed prefix is added afterward, so `summary_content` can exceed the advertised cap. It also uses byte lengths despite being named “chars,” and can split the policy incorrectly for Unicode-heavy content.
+
+Build the prefix first and append content using character-aware truncation within the remaining budget.
+
+18. Index rebuild is impossible with the current trait
+
+Step 150 says:
+
+```rust
+self.rebuild_vector_index_from_sqlite().await?;
+```
+
+and describes clearing the live vector store. But `VectorStore` has no `clear()` or enumeration/replacement operation.
+
+Add:
+
+```rust
+async fn clear(&self) -> Result<()>;
+```
+
+Or construct a fresh backend and atomically replace it—which requires interior mutability around the backend field and is unsuitable for arbitrary remote stores.
+
+For remote backends, a namespace/generation strategy may be safer than destructive `clear()`.
+
+19. Compression does not compensate if `mark_all_superseded()` fails
+
+The summary is stored before originals are marked. If marking fails, an unlinked summary remains active. This repeats the same bug M5 explicitly tried to fix.
+
+On failure, delete the new summary from SQLite and vector storage before returning.
+
+20. Compression eligibility should exclude expired memories
+
+The SQL only excludes superseded records. Expired episodic memories could be compressed into a fresh summary immediately before purge. Add:
+
+```sql
+AND (expires_at IS NULL OR expires_at >= :now)
+```
+
+## Maintenance faults
+
+21. Tokio intervals fire immediately
+
+The plan explicitly says the first tick does not fire immediately, but:
+
+```rust
+tokio::time::interval(config.purge_interval)
+```
+
+does fire immediately.
+
+Use `interval_at`:
+
+```rust
+let now = tokio::time::Instant::now();
+let mut purge_tick =
+    tokio::time::interval_at(now + config.purge_interval, config.purge_interval);
+```
+
+Do the same for compression.
+
+22. Missing dependencies/features
+
+The plan uses but does not completely add:
+
+- `tracing`
+- `urlencoding`
+- A mock-server dev dependency such as `wiremock`
+- Tokio’s `test-util` feature for `start_paused` and `advance`
+
+Add these explicitly and feature-gate `urlencoding` with VecLite if it is only used there.
+
+23. Engine-drop maintenance test is underspecified
+
+Dropping the last engine `Arc` does not let the caller await task exit unless it still owns the `MaintenanceHandle`. That part is possible, but the plan must specify:
+
+1. Keep the handle.
+2. Drop the engine.
+3. Advance time so a branch attempts `Weak::upgrade()`.
+4. Await `handle.shutdown()` or expose a separate `join()`.
+
+Calling `shutdown()` immediately tests cancellation, not weak-reference exit.
+
+## VecLite faults
+
+24. The plan says “do not invent the protocol,” then immediately provides an invented protocol
+
+Steps 191 and 193 contradict each other. Until a real VecLite API is pinned, the entire adapter snippet is illustrative only and must not be called executable.
+
+Make Step 193 conditional:
+
+> Only after Step 191 records the real endpoints and wire types, generate the adapter from that contract. Delete the placeholder endpoint code.
+
+25. `open_with_store()` conflicts with earlier backend ownership
+
+M3 should use `Arc<dyn VectorStore>`, while Step 195 accepts `impl VectorStore` by value. Standardize on:
+
+```rust
+pub async fn open_with_store(
+    path: impl AsRef<Path>,
+    store: Arc<dyn VectorStore>,
+) -> Result<Self>
+```
+
+Also resolve the backfill contradiction:
+
+- M3 says opening backfills persistent embeddings.
+- M11 says historical remote backfill is the caller’s responsibility.
+
+Use an explicit policy:
+
+```rust
+pub enum BackfillPolicy {
+    ExistingOnly,
+    InsertMissing,
+    Rebuild,
+}
+```
+
+## Design/test weaknesses
+
+26. `as_prompt_context()` does not truly enforce `max_chars`
+
+The header alone can exceed a small budget, and `String::len()` counts bytes, not characters. The escaping also does not neutralize prompt injection; delimiting content is useful, but the documentation must not imply it makes content safe.
+
+27. Ranking functions accept invalid/future values
+
+`days_since_access < 0` makes recency greater than 1. Similarity, importance and confidence are not clamped or validated, and non-finite scores can break ordering.
+
+Validate persisted values and clamp temporal calculations at zero.
+
+28. Real sleeps remain in tests
+
+Step 91 waits six seconds, despite later requiring clock-controlled tests. Use direct expiry backdating or an injected clock. Do not add multi-second sleeps to the normal suite.
+
+29. “Everything above is internally consistent” is incorrect
+
+The final assertion at the end of the plan should be removed until the issues above are repaired.
+
+## Verdict
+
+The plan has the right overall milestone order and many good corrections, but it is not yet properly executable. I would rate it:
+
+- Architecture and sequencing: 7/10
+- Compile readiness: 4/10
+- Persistence correctness: 6/10
+- Concurrency/lifecycle correctness: 6/10
+- Overall executable as written: no
+
+The minimum required repair is to standardize the engine architecture everywhere:
+
+```rust
+pub struct MemoryEngine {
+    conn: Mutex<Connection>,
+    embedder: Mutex<Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+}
+```
+
+Then eliminate every `self.db`/`src/db/queries.rs` reference, add the missing error variants and dependencies, correct UUID conversions and decoder column order, specify compensating writes, and repair streaming/compression/maintenance lifecycle behavior. No project files were changed during this review.

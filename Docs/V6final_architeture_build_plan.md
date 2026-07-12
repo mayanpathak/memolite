@@ -2118,3 +2118,402 @@ v6's ordering guarantee, unchanged in spirit from v5 but now actually true at ev
 including Step 0 itself: **every code block, at every milestone, only calls functions and
 references fields that were fully defined at or before that point in this document — and no
 milestone leaves a type described-but-undefined for a later milestone to invent.**
+
+
+
+
+#### SHORTCOMINGS OF THIS BUILDING PLAN ###
+
+V6 closes many V5 findings, but it still is not fully executable milestone-by-milestone. The remaining faults are now mostly sequencing and several concrete compile/runtime bugs.
+
+No repository files were modified.
+
+## Critical compile blockers
+
+### 1. Step 0 migration code references the future M6 confidence module
+
+At [plan line 541](C:\Users\Mayan\.codex\attachments\e7bdf8e4-1ec7-4d93-a491-2fa2874fcf22\pasted-text.txt:541), the Step 0 migration runner calls:
+
+```rust
+crate::confidence::repair_confidence_column(conn)?;
+```
+
+But `src/confidence.rs` and `repair_confidence_column()` are not created until M6.
+
+Therefore Step 0 cannot compile.
+
+Correct sequencing:
+
+```rust
+// Step 0 run_migrations():
+run_baseline_migration(conn)?;
+```
+
+Then M6 edits it to:
+
+```rust
+run_baseline_migration(conn)?;
+crate::confidence::repair_confidence_column(conn)?;
+```
+
+Alternatively, create the confidence migration infrastructure in Step 0 and only add the typed ranking behavior in M6.
+
+### 2. The “authoritative final lib.rs” breaks every early milestone
+
+At [plan line 635](C:\Users\Mayan\.codex\attachments\e7bdf8e4-1ec7-4d93-a491-2fa2874fcf22\pasted-text.txt:635), Step 0 declares modules whose files do not exist yet:
+
+```rust
+pub mod ranking;
+pub mod requests;
+pub mod confidence;
+pub mod streaming;
+pub mod compression;
+pub mod maintenance;
+pub mod stats;
+```
+
+It also exports types that do not exist until later milestones.
+
+Rust requires every declared module file and exported item to exist immediately. The Step 0 checkpoint will fail.
+
+Keep the final block as a reference, but add module lines incrementally. At Step 0, only register files that actually exist:
+
+```rust
+pub mod embedder;
+pub mod engine;
+pub mod error;
+pub mod memory;
+pub mod recall;
+pub mod vector_store;
+mod migrations;
+
+pub use engine::{BackfillPolicy, MemoryEngine};
+pub use error::{MemoliteError, Result};
+pub use memory::{Memory, MemoryType};
+pub use vector_store::{
+    InMemoryVectorStore, VectorEntry, VectorHit, VectorStore,
+};
+```
+
+Then add later modules in their corresponding milestones.
+
+### 3. The final `lib.rs` accidentally removes the existing memory module
+
+The actual crate currently has:
+
+```rust
+pub mod memory;
+pub use memory::{Memory, MemoryType};
+```
+
+V6’s authoritative block omits both lines. That breaks existing imports and the public API.
+
+Preserve them exactly.
+
+### 4. M3 `recall()` references M4 APIs
+
+At [plan line 783](C:\Users\Mayan\.codex\attachments\e7bdf8e4-1ec7-4d93-a491-2fa2874fcf22\pasted-text.txt:783), M3 implements:
+
+```rust
+self.recall_query(crate::RecallQuery::new(query_text))
+```
+
+But neither `RecallQuery` nor `recall_query()` exists until M4. Consequently the M3 checkpoint cannot compile or run its recall tests.
+
+Use one of these options:
+
+- Keep a temporary M3 cosine-only `recall()` implementation, then replace it with delegation in M4.
+- Move `RecallQuery`, `RecallResult`, ranking and `recall_query()` into M3.
+
+The first option is simpler and matches the natural milestone progression.
+
+### 5. `open_with_store_internal()` is inaccessible from M11
+
+It is defined as a private associated function inside the `engine` module:
+
+```rust
+async fn open_with_store_internal(...)
+```
+
+M11 implements `open_with_store()` from another module and calls it:
+
+```rust
+Self::open_with_store_internal(...)
+```
+
+Rust module privacy prevents that.
+
+Change it to:
+
+```rust
+pub(crate) async fn open_with_store_internal(...)
+```
+
+or define the public `open_with_store()` inside `engine.rs`.
+
+## Additional compile/correctness faults
+
+### 6. Compression imports `Memory` from the wrong module
+
+V6 uses:
+
+```rust
+use crate::engine::Memory;
+```
+
+But `Memory` is defined in `crate::memory`, and `engine` does not publicly re-export it.
+
+Use:
+
+```rust
+use crate::memory::Memory;
+```
+
+or, after restoring the crate-root export:
+
+```rust
+use crate::Memory;
+```
+
+### 7. M9 does not validate embedding dimension correctly
+
+This line is ineffective:
+
+```rust
+validate_vector(
+    &format!("embedding for {}", m.id),
+    &vector,
+    vector.len().max(1),
+)?;
+```
+
+It compares the vector length to itself, so every nonempty length passes. It only indirectly checks finiteness.
+
+Validate against the active backend dimension:
+
+```rust
+let expected_dim = {
+    let guard = self.vector_store
+        .read()
+        .map_err(|_| MemoliteError::Internal(
+            "vector-store lock poisoned".into()
+        ))?;
+    guard.dimension()
+};
+
+validate_vector(
+    &format!("embedding for {}", m.id),
+    &vector,
+    expected_dim,
+)?;
+```
+
+Also read and verify the persisted `embeddings.dimension` value. The current repository’s `get_embedding()` ignores that column after fetching it.
+
+### 8. Compression summary truncation can panic on Unicode
+
+V6 does:
+
+```rust
+summary.truncate(MAX_SUMMARY_CHARS);
+```
+
+`String::truncate()` expects a byte index at a UTF-8 character boundary. `MAX_SUMMARY_CHARS == 2000` may land inside a multibyte character and panic.
+
+Use character-aware truncation:
+
+```rust
+summary = summary.chars().take(MAX_SUMMARY_CHARS).collect();
+```
+
+The constant is named “chars,” so character counting is the expected behavior.
+
+### 9. `row_to_memory()` silently accepts corrupt timestamps and UUIDs
+
+V6 replaces the repository’s careful conversion logic with:
+
+```rust
+DateTime::from_timestamp(...).unwrap_or_default()
+Uuid::parse_str(&s).ok()
+```
+
+That silently turns corrupt timestamps into defaults and corrupt `superseded_by` values into `None`. This is a regression from the current typed-error behavior.
+
+Retain the existing helpers:
+
+```rust
+let created_at = timestamp_to_datetime(created_at_ts, 5)?;
+let last_accessed = timestamp_to_datetime(last_accessed_ts, 6)?;
+
+let superseded_by = superseded_by_str
+    .map(|s| Uuid::parse_str(&s))
+    .transpose()
+    .map_err(|e| to_sql_conversion_err(8, e))?;
+```
+
+Only append confidence parsing at column 10.
+
+### 10. M6 migration ordering is conceptually reversed
+
+V6 says confidence is “introduced at M6,” but Step 0’s `run_migrations()` already requires it. Besides the compile problem, a Step 0 database immediately lands at schema version 2 before the M6 code understands that column.
+
+Choose a consistent model:
+
+- Recommended: Step 0 only applies version 1. M6 introduces and records version 2.
+- Alternative: create the confidence column and enum in Step 0, while M6 only activates weighting/promotion.
+
+Do not mix those models.
+
+## Runtime/behavioral issues
+
+### 11. `shutdown_now()` is not guaranteed to stop promptly
+
+The streaming loop uses an unbiased `tokio::select!` between cancellation and `rx.recv()`. When cancellation is ready and the queue is also continuously ready, Tokio may select receive repeatedly.
+
+For immediate shutdown, bias cancellation:
+
+```rust
+tokio::select! {
+    biased;
+
+    _ = cancel_clone.cancelled() => break,
+    maybe_chunk = rx.recv() => {
+        // process chunk
+    }
+}
+```
+
+This is correct here because `finish()` is the separate drain operation. Earlier plans could not use biased cancellation because they incorrectly promised draining from the same method; V6 now has two methods, so biasing `shutdown_now()` is appropriate.
+
+### 12. `IngestReport` loses failure details
+
+It reports only counts:
+
+```rust
+received
+stored
+failed
+```
+
+Earlier versions included per-item errors. Without them, callers know something failed but not what or why.
+
+Add:
+
+```rust
+pub errors: Vec<IngestFailure>
+
+pub struct IngestFailure {
+    pub preview: String,
+    pub error: String,
+}
+```
+
+This is not a compile blocker, but it makes the “observable errors” feature substantially more useful.
+
+### 13. `ExistingOnly` still performs full local reconciliation validation
+
+`reconcile_vector_index()` reads and validates every SQLite memory/embedding pair before matching on:
+
+```rust
+BackfillPolicy::ExistingOnly
+```
+
+That policy says “do not touch the remote store,” but opening can still fail because a local embedding is corrupt. This may be intentional, but the documentation should state it.
+
+If `ExistingOnly` truly means “do not reconcile at all,” return before loading entries:
+
+```rust
+if policy == BackfillPolicy::ExistingOnly {
+    return Ok(());
+}
+```
+
+### 14. `UpsertLocal` can leave stale vectors for deleted local rows
+
+That is inherent in its nondestructive design and acceptable for a shared backend, but recall may repeatedly receive stale remote hits that SQLite then rejects. Document candidate-pool pollution and recommend per-database namespaces/collections when possible.
+
+## Benchmark faults
+
+### 15. The store benchmark primarily measures model initialization
+
+This benchmark creates a new engine inside every iteration:
+
+```rust
+|| MemoryEngine::open(":memory:")
+```
+
+`MemoryEngine::open()` loads the FastEmbed model, which is expensive. The benchmark named `store_single_memory` therefore measures model loading plus engine initialization plus storing.
+
+Separate these:
+
+- `engine_open_with_model_load`
+- `store_single_memory` using a pre-opened engine or batched temporary databases with one already-loaded embedder
+- `recall_against_N_memories`
+
+Model loading may dominate so heavily that the actual store performance becomes invisible.
+
+### 16. Benchmarking 100,000 vectors may make `cargo bench` very slow
+
+Each Criterion benchmark performs many full linear scans over 100k × 384 floats. That is useful as a scale test, but default `cargo bench` could take a long time.
+
+Use a benchmark group with reduced sample size and measurement duration for 100k:
+
+```rust
+let mut group = c.benchmark_group("vector_search");
+group.sample_size(10);
+group.measurement_time(Duration::from_secs(10));
+```
+
+Or keep 100k as an ignored/manual benchmark profile.
+
+## Scope consistency issue
+
+### 17. `clear()` is now redundant but still mandatory
+
+Once `replace_all()` is the sole reconciliation primitive, `clear()` is no longer required by the engine. Keeping both expands every backend’s required API and can introduce inconsistent semantics.
+
+Consider removing `clear()` from `VectorStore`. Empty replacement already expresses the operation:
+
+```rust
+store.replace_all(Vec::new()).await?;
+```
+
+If retained for convenience, give it a default implementation:
+
+```rust
+async fn clear(&self) -> Result<()> {
+    self.replace_all(Vec::new()).await
+}
+```
+
+## Verdict
+
+V6 materially improves V5:
+
+- `replace_all()` is well designed.
+- Backfill policy is explicit.
+- Missing embeddings are treated as corruption.
+- Streaming and compression are now concretely specified.
+- Stats and benchmarks exist.
+- Vector validation is centralized.
+- Access-stat refetch behavior is consistent in M4.
+- Generic HTTP is much more complete.
+
+But four direct blockers remain:
+
+1. Step 0 migration runner references the future confidence module.
+2. The upfront final `lib.rs` references future nonexistent modules and omits `memory`.
+3. M3 recall references M4 types and methods.
+4. M11 cannot call private `open_with_store_internal()`.
+
+Once those four are fixed, the plan will be close to genuinely executable. The remaining items are smaller correctness and quality improvements.
+
+My rating:
+
+- Architecture: 9.2/10
+- Persistence and reconciliation: 9/10
+- Compile readiness by milestone: 7.5/10
+- Self-containedness: 9/10
+- Overall executable as written: not yet
+
+This version needs a small sequencing-focused V7 rather than another architectural redesign.

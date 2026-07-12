@@ -1501,3 +1501,7 @@ impl VectorStore for GenericHttpVectorStore {
 v4's ordering guarantee: **every code block, at every milestone, only calls functions that were
 defined at or before that milestone in this document.** That's the concrete, checkable meaning of
 "properly executable as written," which was the v3 review's central complaint.
+
+
+
+#### SHORTCOMINGS OF THIS BUILDING PLAN ###
