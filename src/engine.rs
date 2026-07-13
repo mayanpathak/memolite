@@ -1,13 +1,10 @@
-
-
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use crate::embedder::Embedder;
@@ -128,12 +125,21 @@ impl MemoryEngine {
     /// restart-reconcile time). If the vector-store insert fails, the
     /// SQLite rows are compensated away rather than left as an orphaned
     /// memory no `recall()` will ever find.
-    pub async fn store(&self, content: &str, memory_type: MemoryType, importance: f32) -> Result<String> {
+    pub async fn store(
+        &self,
+        content: &str,
+        memory_type: MemoryType,
+        importance: f32,
+    ) -> Result<String> {
         if content.trim().is_empty() {
-            return Err(MemoliteError::InvalidArgument("content must not be empty".into()));
+            return Err(MemoliteError::InvalidArgument(
+                "content must not be empty".into(),
+            ));
         }
         if !(0.0..=1.0).contains(&importance) {
-            return Err(MemoliteError::InvalidArgument("importance must be in [0.0, 1.0]".into()));
+            return Err(MemoliteError::InvalidArgument(
+                "importance must be in [0.0, 1.0]".into(),
+            ));
         }
 
         let id = Uuid::new_v4();
@@ -246,7 +252,9 @@ impl MemoryEngine {
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
 
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1");
-        let memory = conn.query_row(&sql, params![id], row_to_memory).optional()?;
+        let memory = conn
+            .query_row(&sql, params![id], row_to_memory)
+            .optional()?;
 
         Ok(memory)
     }
@@ -287,7 +295,10 @@ impl MemoryEngine {
 
     /// Returns the dimension of vectors produced by this engine's embedder.
     pub fn dimension(&self) -> usize {
-        self.embedder.lock().expect("embedder mutex poisoned").dimension()
+        self.embedder
+            .lock()
+            .expect("embedder mutex poisoned")
+            .dimension()
     }
 
     /// Permanently deletes a memory (hard delete). Deleting a nonexistent
@@ -329,33 +340,31 @@ impl MemoryEngine {
         Ok(())
     }
 
+   
+
     /// Removes every expired memory from SQLite and the live vector index.
+    ///
     /// Returns the number of deleted rows.
     pub async fn purge_expired(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
 
-        let expired_ids: Vec<String> = {
+        let deleted_ids: Vec<String> = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
 
-            let mut stmt =
-                conn.prepare("SELECT id FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1")?;
-            let ids = stmt
-                .query_map(params![now], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-
-            conn.execute(
-                "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
-                params![now],
+            let mut stmt = conn.prepare(
+                "DELETE FROM memories
+                 WHERE expires_at IS NOT NULL AND expires_at < ?1
+                 RETURNING id",
             )?;
 
-            ids
+            stmt.query_map(params![now], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        if expired_ids.is_empty() {
+        if deleted_ids.is_empty() {
             return Ok(0);
         }
 
@@ -368,26 +377,27 @@ impl MemoryEngine {
         };
 
         let mut vector_errors = Vec::new();
-        for id in &expired_ids {
+
+        for id in &deleted_ids {
             if let Ok(uuid) = Uuid::parse_str(id) {
-                if let Err(e) = store.delete(uuid).await {
-                    vector_errors.push(e.to_string());
+                if let Err(error) = store.delete(uuid).await {
+                    vector_errors.push(error.to_string());
                 }
             }
         }
 
         if !vector_errors.is_empty() {
-            if let Err(reconcile_err) =
+            if let Err(reconcile_error) =
                 reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
             {
                 return Err(MemoliteError::CompensationFailed {
                     operation: vector_errors.join("; "),
-                    compensation: reconcile_err.to_string(),
+                    compensation: reconcile_error.to_string(),
                 });
             }
         }
 
-        Ok(expired_ids.len())
+        Ok(deleted_ids.len())
     }
 }
 
@@ -453,8 +463,13 @@ async fn reconcile_vector_index(
                 )));
             }
 
-            let metadata: HashMap<String, serde_json::Value> = serde_json::from_str(&metadata_json)?;
-            out.push(VectorEntry { id, vector, metadata });
+            let metadata: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&metadata_json)?;
+            out.push(VectorEntry {
+                id,
+                vector,
+                metadata,
+            });
         }
         out
     }; // conn guard dropped here -- before any await below
@@ -493,7 +508,9 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let last_accessed = timestamp_to_datetime(last_accessed_ts, 6)?;
 
     let expires_at_ts: Option<i64> = row.get(7)?;
-    let expires_at = expires_at_ts.map(|ts| timestamp_to_datetime(ts, 7)).transpose()?;
+    let expires_at = expires_at_ts
+        .map(|ts| timestamp_to_datetime(ts, 7))
+        .transpose()?;
 
     let superseded_by_str: Option<String> = row.get(8)?;
     let superseded_by = superseded_by_str
@@ -527,20 +544,24 @@ where
 }
 
 fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>> {
-    Utc.timestamp_opt(ts, 0)
-        .single()
-        .ok_or_else(|| to_sql_conversion_err(col, MemoliteError::Other(anyhow::anyhow!("timestamp out of range"))))
+    Utc.timestamp_opt(ts, 0).single().ok_or_else(|| {
+        to_sql_conversion_err(
+            col,
+            MemoliteError::Other(anyhow::anyhow!("timestamp out of range")),
+        )
+    })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::vector_store::VectorHit;
+    use async_trait::async_trait;
 
     #[tokio::test]
     async fn store_persists_an_embedding_of_the_right_dimension() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
 
         let id = engine
             .store("user prefers dark mode", MemoryType::Semantic, 0.8)
@@ -554,26 +575,37 @@ mod tests {
             .expect("embedding should exist");
 
         assert_eq!(vector.len(), engine.dimension());
-        assert!(vector.iter().any(|v| *v != 0.0), "embedding should not be all zeros");
+        assert!(
+            vector.iter().any(|v| *v != 0.0),
+            "embedding should not be all zeros"
+        );
     }
 
     #[tokio::test]
     async fn store_rejects_empty_content() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
         let result = engine.store("   ", MemoryType::Working, 0.5).await;
         assert!(result.is_err(), "storing empty content should fail");
     }
 
     #[tokio::test]
     async fn store_rejects_out_of_range_importance() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
-        let result = engine.store("valid content", MemoryType::Working, 1.5).await;
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let result = engine
+            .store("valid content", MemoryType::Working, 1.5)
+            .await;
         assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
     }
 
     #[tokio::test]
     async fn store_populates_the_live_vector_index() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
         let id = engine
             .store("user prefers dark mode", MemoryType::Semantic, 0.8)
             .await
@@ -591,7 +623,9 @@ mod tests {
 
     #[tokio::test]
     async fn forget_removes_from_the_live_vector_index() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
         let id = engine
             .store("temporary note", MemoryType::Working, 0.2)
             .await
@@ -609,7 +643,9 @@ mod tests {
 
     #[tokio::test]
     async fn forget_rejects_malformed_id_without_side_effects() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
         let id = engine
             .store("should survive", MemoryType::Working, 0.5)
             .await
@@ -631,17 +667,22 @@ mod tests {
 
     #[tokio::test]
     async fn forget_on_a_wellformed_but_nonexistent_id_is_a_noop() {
-        let engine = MemoryEngine::open(":memory:").await.expect("engine should open");
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
         let result = engine.forget(&Uuid::new_v4().to_string()).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn reopening_reconstructs_the_vector_index() {
-        let path = std::env::temp_dir().join(format!("memolite-step0-restart-{}.db", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("memolite-step0-restart-{}.db", Uuid::new_v4()));
 
         let id = {
-            let engine = MemoryEngine::open(&path).await.expect("first open should succeed");
+            let engine = MemoryEngine::open(&path)
+                .await
+                .expect("first open should succeed");
             engine
                 .store("user prefers dark mode", MemoryType::Semantic, 0.8)
                 .await
@@ -649,7 +690,9 @@ mod tests {
             // engine (and its in-RAM vector index) dropped here
         };
 
-        let engine = MemoryEngine::open(&path).await.expect("second open should succeed");
+        let engine = MemoryEngine::open(&path)
+            .await
+            .expect("second open should succeed");
 
         let store = {
             let guard = engine.vector_store.read().unwrap();
@@ -661,15 +704,20 @@ mod tests {
             "reopening must repopulate the vector index from SQLite"
         );
 
-        let _ = std::fs::remove_file(&path);
+        // Explicitly drop engine before removing file
+        drop(engine);
+        std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 
     #[tokio::test]
     async fn corrupt_memory_row_with_no_embedding_fails_loudly_on_reopen() {
-        let path = std::env::temp_dir().join(format!("memolite-step0-corrupt-{}.db", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("memolite-step0-corrupt-{}.db", Uuid::new_v4()));
 
         let id = {
-            let engine = MemoryEngine::open(&path).await.expect("first open should succeed");
+            let engine = MemoryEngine::open(&path)
+                .await
+                .expect("first open should succeed");
             engine
                 .store("will be corrupted", MemoryType::Working, 0.5)
                 .await
@@ -683,6 +731,8 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             conn.execute("DELETE FROM embeddings WHERE memory_id = ?1", params![id])
                 .unwrap();
+            // Explicitly drop the raw connection before reopening
+            drop(conn);
         }
 
         let result = MemoryEngine::open(&path).await;
@@ -691,7 +741,10 @@ mod tests {
             "a memory row with no embedding must surface as Corruption, not be silently skipped"
         );
 
-        let _ = std::fs::remove_file(&path);
+        // If open succeeded, we'd have an engine to drop, but it failed so we just
+        // need to clean up the file. The failed engine's connection was dropped
+        // when it went out of scope.
+        std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 
     /// A `VectorStore` test double whose `insert` always fails, used to
@@ -701,7 +754,12 @@ mod tests {
 
     #[async_trait]
     impl VectorStore for AlwaysFailsInsert {
-        async fn insert(&self, _id: Uuid, _vector: &[f32], _metadata: HashMap<String, serde_json::Value>) -> Result<()> {
+        async fn insert(
+            &self,
+            _id: Uuid,
+            _vector: &[f32],
+            _metadata: HashMap<String, serde_json::Value>,
+        ) -> Result<()> {
             Err(MemoliteError::VectorStore("simulated failure".into()))
         }
         async fn search(&self, _query: &[f32], _k: usize) -> Result<Vec<VectorHit>> {
@@ -723,7 +781,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_rolls_back_orphaned_sqlite_rows_if_the_vector_store_insert_fails() {
-        let path = std::env::temp_dir().join(format!("memolite-step0-compensate-{}.db", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("memolite-step0-compensate-{}.db", Uuid::new_v4()));
 
         let engine = MemoryEngine::open_with_store_internal(
             &path,
@@ -733,13 +792,29 @@ mod tests {
         .await
         .expect("engine should open even though its store will fail later");
 
-        let result = engine.store("this insert will fail downstream", MemoryType::Working, 0.5).await;
-        assert!(matches!(result, Err(MemoliteError::CompensationFailed { .. }) | Err(MemoliteError::VectorStore(_))));
+        let result = engine
+            .store("this insert will fail downstream", MemoryType::Working, 0.5)
+            .await;
+        assert!(matches!(
+            result,
+            Err(MemoliteError::CompensationFailed { .. }) | Err(MemoliteError::VectorStore(_))
+        ));
+
+        // Explicitly drop engine before opening a raw connection to avoid
+        // file locking issues on Windows
+        drop(engine);
 
         let conn = Connection::open(&path).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 0, "a failed vector-store insert must not leave an orphaned memories row");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a failed vector-store insert must not leave an orphaned memories row"
+        );
 
-        let _ = std::fs::remove_file(&path);
+        // Explicitly drop the connection before removing the file
+        drop(conn);
+        std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 }

@@ -9,14 +9,11 @@
 
 use chrono::{Duration, Utc};
 use memolite::{MemoryEngine, MemoryType};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 fn temp_db_path(test_name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "memolite-test-{test_name}-{}.db",
-        Uuid::new_v4()
-    ))
+    std::env::temp_dir().join(format!("memolite-test-{test_name}-{}.db", Uuid::new_v4()))
 }
 
 #[tokio::test]
@@ -67,6 +64,8 @@ async fn purge_expired_deletes_only_expired_memories() {
                 ],
             )
             .expect("manual insert failed");
+        // Explicitly drop the raw connection before continuing
+        drop(raw_conn);
     }
 
     // Sanity check: both rows exist before purging.
@@ -74,7 +73,10 @@ async fn purge_expired_deletes_only_expired_memories() {
     assert!(engine.get(&expired_id).await.unwrap().is_some());
 
     // Purge. Only the manually-inserted expired row should go.
-    let deleted_count = engine.purge_expired().await.expect("purge_expired() failed");
+    let deleted_count = engine
+        .purge_expired()
+        .await
+        .expect("purge_expired() failed");
     assert_eq!(deleted_count, 1);
 
     // The expired one is gone...
@@ -85,5 +87,7 @@ async fn purge_expired_deletes_only_expired_memories() {
     let live_after = engine.get(&live_id).await.expect("get() failed");
     assert!(live_after.is_some());
 
-    let _ = std::fs::remove_file(&path);
+    // Explicitly drop engine before removing the file
+    drop(engine);
+    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }

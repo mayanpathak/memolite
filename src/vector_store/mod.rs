@@ -56,7 +56,12 @@ pub fn validate_vector(label: &str, v: &[f32], dim: usize) -> Result<()> {
 pub trait VectorStore: Send + Sync {
     /// MUST be an idempotent upsert. MUST call `validate_vector` on
     /// `vector` before storing anything.
-    async fn insert(&self, id: Uuid, vector: &[f32], metadata: HashMap<String, Value>) -> Result<()>;
+    async fn insert(
+        &self,
+        id: Uuid,
+        vector: &[f32],
+        metadata: HashMap<String, Value>,
+    ) -> Result<()>;
 
     /// MUST call `validate_vector` on `query` before searching.
     async fn search(&self, query: &[f32], k: usize) -> Result<Vec<VectorHit>>;

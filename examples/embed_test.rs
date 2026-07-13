@@ -20,9 +20,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 fn main() -> Result<()> {
     // Downloads the model once (first run only).
     // Afterwards it loads from the local cache.
-   let mut model = TextEmbedding::try_new(
-    InitOptions::new(EmbeddingModel::AllMiniLML6V2),
-)?;
+    let mut model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))?;
 
     let texts = vec![
         "I love Rust",
@@ -43,17 +41,13 @@ fn main() -> Result<()> {
     println!("\n----------------------------------------");
 
     // Cosine similarities
-    let rust_pair =
-        cosine_similarity(&embeddings[0], &embeddings[1]);
+    let rust_pair = cosine_similarity(&embeddings[0], &embeddings[1]);
 
-    let rust_weather =
-        cosine_similarity(&embeddings[0], &embeddings[2]);
+    let rust_weather = cosine_similarity(&embeddings[0], &embeddings[2]);
 
-    let rust_pizza =
-        cosine_similarity(&embeddings[0], &embeddings[3]);
+    let rust_pizza = cosine_similarity(&embeddings[0], &embeddings[3]);
 
-    let weather_pizza =
-        cosine_similarity(&embeddings[2], &embeddings[3]);
+    let weather_pizza = cosine_similarity(&embeddings[2], &embeddings[3]);
 
     println!("Cosine Similarities");
     println!("===================");

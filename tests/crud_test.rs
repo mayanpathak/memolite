@@ -11,7 +11,10 @@ use uuid::Uuid;
 /// Builds a unique path in the OS temp dir for each test run, so parallel
 /// `cargo test` runs don't collide on the same `.db` file.
 fn temp_db_path(test_name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("context-memory-test-{test_name}-{}.db", Uuid::new_v4()))
+    std::env::temp_dir().join(format!(
+        "context-memory-test-{test_name}-{}.db",
+        Uuid::new_v4()
+    ))
 }
 
 /// Test 1: store a memory, then get() it back, and assert the content matches.
@@ -24,11 +27,7 @@ async fn store_then_get_returns_matching_memory() {
 
     // Store a memory and keep the returned ID.
     let id = engine
-        .store(
-            "Rust is my favorite language",
-            MemoryType::Semantic,
-            0.9,
-        )
+        .store("Rust is my favorite language", MemoryType::Semantic, 0.9)
         .await
         .expect("store() failed");
 
@@ -45,8 +44,9 @@ async fn store_then_get_returns_matching_memory() {
     assert_eq!(fetched.importance, 0.9);
     assert_eq!(fetched.id.to_string(), id);
 
-    // Clean up the temp db file.
-    let _ = std::fs::remove_file(&path);
+    // Explicitly drop engine before removing the file
+    drop(engine);
+    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }
 
 /// Test 2: forget() a memory, then get() it, and assert it returns None.
@@ -73,5 +73,7 @@ async fn forget_removes_the_memory() {
     let fetched = engine.get(&id).await.expect("get() failed");
     assert!(fetched.is_none());
 
-    let _ = std::fs::remove_file(&path);
+    // Explicitly drop engine before removing the file
+    drop(engine);
+    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }

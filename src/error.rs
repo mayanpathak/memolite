@@ -1,6 +1,3 @@
-
-
-
 //! Crate-wide error type.
 //!
 //! Every fallible operation in `memolite` returns this error type instead of
@@ -98,5 +95,8 @@ pub enum MemoliteError {
     /// that was supposed to clean up after it *also* failed. Both messages
     /// are kept so an operator isn't left guessing which half broke.
     #[error("operation failed: {operation}; compensation also failed: {compensation}")]
-    CompensationFailed { operation: String, compensation: String },
+    CompensationFailed {
+        operation: String,
+        compensation: String,
+    },
 }

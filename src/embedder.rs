@@ -32,15 +32,10 @@ impl Embedder {
 
         let start = Instant::now();
 
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2),
-        )
-        .map_err(|e| MemoliteError::EmbeddingInit(e.to_string()))?;
+        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
+            .map_err(|e| MemoliteError::EmbeddingInit(e.to_string()))?;
 
-        eprintln!(
-            "[memolite] embedding model ready in {:?}",
-            start.elapsed()
-        );
+        eprintln!("[memolite] embedding model ready in {:?}", start.elapsed());
 
         // AllMiniLML6V2 is a fixed 384-dimensional model. If the model
         // choice ever becomes configurable, this should be derived from the
@@ -74,9 +69,9 @@ impl Embedder {
         #[cfg(not(debug_assertions))]
         let _ = start;
 
-        embeddings.pop().ok_or_else(|| {
-            MemoliteError::EmbeddingFailed("model returned no vectors".into())
-        })
+        embeddings
+            .pop()
+            .ok_or_else(|| MemoliteError::EmbeddingFailed("model returned no vectors".into()))
     }
 
     /// The length of every vector this embedder produces.
