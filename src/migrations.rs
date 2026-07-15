@@ -1,3 +1,5 @@
+
+
 //! SQLite schema management.
 //!
 //! `run_migrations` is idempotent and versioned: it can be called every
@@ -21,7 +23,7 @@
 
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{MemoliteError, Result};
 
 pub fn run_migrations(conn: &mut Connection) -> Result<()> {
     // PRAGMAs are per-connection, not persisted in the database file --
@@ -87,6 +89,26 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
     }
 
     tx.commit()?;
+
+    // Orphan/FK-drift detection (Phase 1, Step 5). `embeddings.memory_id`
+    // has always declared `ON DELETE CASCADE`, but before this file existed
+    // nothing ever turned `PRAGMA foreign_keys = ON`, so old databases can
+    // still be carrying orphaned `embeddings` rows from before enforcement
+    // was ever active. This check runs on every `open()`, not just once,
+    // and fails loudly instead of letting a corrupted file silently limp
+    // along.
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let violations: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    if !violations.is_empty() {
+        return Err(MemoliteError::Corruption(format!(
+            "foreign key violations detected in table(s): {}",
+            violations.join(", ")
+        )));
+    }
 
     // Migration 2 (the `confidence` column) is added in M6, alongside
     // src/confidence.rs, as ONE MORE LINE appended right here:

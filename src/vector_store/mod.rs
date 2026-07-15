@@ -52,6 +52,33 @@ pub fn validate_vector(label: &str, v: &[f32], dim: usize) -> Result<()> {
 /// everywhere the engine needs to make a backend's contents agree with
 /// SQLite: restart backfill today, forget/purge failure recovery, and
 /// later milestones' index rebuild.
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
+///
+/// Backend responsibilities (every implementor MUST uphold these):
+/// - No duplicate IDs are ever stored -- `insert` is an upsert.
+/// - Every similarity score returned from `search` is finite.
+/// - `search` returns at most `k` results.
+/// - `validate_vector` is called (and its error propagated) before storing
+///   or searching any vector -- no implementor skips this because a
+///   sibling method already checks something similar.
+///
+/// Engine behavior in M3 (documented limitation, not an oversight): the
+/// engine trusts an in-tree backend's output without defensively
+/// re-validating it (re-checking scores are finite, re-checking the
+/// result count is `<= k`, etc). Defensive re-validation of backend output
+/// is not implemented yet.
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
+/// 
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     /// MUST be an idempotent upsert. MUST call `validate_vector` on

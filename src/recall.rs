@@ -1,5 +1,11 @@
 
 
+
+
+
+
+
+
 //! Recall-time constants and helpers that don't depend on anything defined
 //! later than Step 0.
 //!
@@ -9,6 +15,12 @@
 /// Hard ceiling on how many nearest-neighbor hits `recall_query()` ever
 /// pulls from a `VectorStore` in one call.
 pub const MAX_CANDIDATES: usize = 500;
+
+/// Default number of results a recall call returns once eligibility
+/// filtering and truncation have been applied. M3's temporary `recall()`
+/// uses this directly; M4's `RecallQuery` will expose it as an overridable
+/// default rather than a hard-coded `10` scattered through the engine.
+pub const DEFAULT_RECALL_LIMIT: usize = 10;
 
 /// Calculates the candidate pool requested from the vector store before
 /// later filtering narrows the result set.
