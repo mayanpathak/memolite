@@ -1,10 +1,3 @@
-
-
-
-
-
-
-
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -36,28 +29,67 @@ impl InMemoryVectorStore {
         }
     }
 
-    fn cosine(a: &[f32], b: &[f32]) -> f32 {
-        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        if norm_a == 0.0 || norm_b == 0.0 {
-            return 0.0;
+    /// Cosine similarity between two vectors.
+    ///
+    /// Hardened per the crate's validation contract (Step 0.3's
+    /// `validate_vector` covers *inputs to the trait*, but this function
+    /// does not assume that already ran -- it re-checks finiteness itself,
+    /// so it is safe to call from anywhere, not just from behind a
+    /// `validate_vector` call):
+    /// - Dot product and both norms are accumulated in `f64`, only cast to
+    ///   `f32` at the very end, so a large-but-finite pair of vectors can't
+    ///   silently overflow `f32` mid-calculation.
+    /// - A zero norm on either side returns `Ok(0.0)` -- a legitimate "no
+    ///   direction" case, not an error.
+    /// - A non-finite component in either input, or a non-finite *result*
+    ///   (the large-finite-value overflow case), returns
+    ///   `Err(VectorStore(...))` rather than silently handing back `0.0`,
+    ///   which would otherwise let a bad score masquerade as "unrelated."
+    fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
+        for &v in a.iter().chain(b.iter()) {
+            if !v.is_finite() {
+                return Err(MemoliteError::VectorStore(
+                    "non-finite value in cosine input".into(),
+                ));
+            }
         }
 
-        dot / (norm_a * norm_b)
+        let mut dot: f64 = 0.0;
+        let mut norm_a: f64 = 0.0;
+        let mut norm_b: f64 = 0.0;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let (x, y) = (x as f64, y as f64);
+            dot += x * y;
+            norm_a += x * x;
+            norm_b += y * y;
+        }
+        let norm_a = norm_a.sqrt();
+        let norm_b = norm_b.sqrt();
+
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return Ok(0.0);
+        }
+
+        let similarity = dot / (norm_a * norm_b);
+        if !similarity.is_finite() {
+            return Err(MemoliteError::VectorStore(
+                "non-finite cosine similarity computed".into(),
+            ));
+        }
+
+        Ok(similarity as f32)
     }
 
     fn lock_read(&self) -> Result<std::sync::RwLockReadGuard<'_, VectorMap>> {
         self.data
             .read()
-            .map_err(|_| MemoliteError::Internal("vector store lock poisoned".into()))
+            .map_err(|_| MemoliteError::VectorStore("vector store lock poisoned".into()))
     }
 
     fn lock_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, VectorMap>> {
         self.data
             .write()
-            .map_err(|_| MemoliteError::Internal("vector store lock poisoned".into()))
+            .map_err(|_| MemoliteError::VectorStore("vector store lock poisoned".into()))
     }
 }
 
@@ -80,11 +112,10 @@ impl VectorStore for InMemoryVectorStore {
         let guard = self.lock_read()?;
         let mut hits: Vec<VectorHit> = guard
             .iter()
-            .map(|(id, (vector, _))| VectorHit {
-                id: *id,
-                score: Self::cosine(query, vector),
+            .map(|(id, (vector, _))| {
+                Self::cosine(query, vector).map(|score| VectorHit { id: *id, score })
             })
-            .collect();
+            .collect::<Result<Vec<VectorHit>>>()?;
 
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         hits.truncate(k);
@@ -230,5 +261,57 @@ mod tests {
 
         assert!(store.replace_all(vec![bad]).await.is_err());
         assert!(store.contains(original).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn zero_norm_vector_yields_zero_similarity_not_an_error() {
+        let store = InMemoryVectorStore::new(2);
+        let id = Uuid::new_v4();
+
+        store.insert(id, &[0.0, 0.0], HashMap::new()).await.unwrap();
+
+        let hits = store.search(&[1.0, 0.0], 1).await.unwrap();
+        assert_eq!(hits[0].score, 0.0);
+    }
+
+    #[tokio::test]
+    async fn large_finite_vectors_do_not_overflow_cosine() {
+        // f32::MAX squared overflows f32 accumulation but not f64 -- this
+        // proves cosine() accumulates in f64 rather than f32.
+        let store = InMemoryVectorStore::new(2);
+        let id = Uuid::new_v4();
+        let big = f32::MAX / 2.0;
+
+        store
+            .insert(id, &[big, big], HashMap::new())
+            .await
+            .unwrap();
+
+        let hits = store.search(&[big, big], 1).await.unwrap();
+        assert!(
+            hits[0].score.is_finite(),
+            "identical large-but-finite vectors must still produce a finite similarity score"
+        );
+        assert!((hits[0].score - 1.0).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn lock_poisoning_surfaces_as_vectorstore_error_not_internal() {
+        // Poison the RwLock by panicking while holding the write guard,
+        // then confirm the resulting error is `VectorStore`, not
+        // `Internal` -- `Internal` is reserved for the engine's own
+        // (`conn`/`embedder`) locks; `VectorStore` means "the backend
+        // broke," and this backend's poisoned lock must say so.
+        let store = std::sync::Arc::new(InMemoryVectorStore::new(2));
+        let store_clone = std::sync::Arc::clone(&store);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = store_clone.data.write().unwrap();
+            panic!("intentionally poisoning the lock");
+        })
+        .join();
+
+        let result = store.insert(Uuid::new_v4(), &[1.0, 0.0], HashMap::new()).await;
+        assert!(matches!(result, Err(MemoliteError::VectorStore(_))));
     }
 }

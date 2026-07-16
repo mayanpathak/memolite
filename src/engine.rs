@@ -49,6 +49,20 @@ pub enum BackfillPolicy {
 /// This is responsible for persistence, embedding generation, and keeping
 /// an in-process vector index in sync with SQLite (the durable source of
 /// truth). Ranking, decay, and consolidation are implemented elsewhere.
+///
+/// Two conventions hold everywhere in this file, not just locally within
+/// one method -- written down here once so they can't drift apart:
+///
+/// - **Expiration boundary:** `expires_at <= now` means "expired,"
+///   everywhere -- recall filtering, `purge_expired()` eligibility, and
+///   `reconcile_vector_index()` all use this exact boundary. Never `<` in
+///   one place and `<=` in another.
+/// - **Compensation policy:** when a SQLite write succeeds but the paired
+///   vector-store write/delete fails, the engine attempts best-effort
+///   reconciliation (via `reconcile_vector_index`) but *always* surfaces
+///   the *original* error as `Err`. A successful reconciliation never
+///   silently upgrades a real failure into `Ok` -- applies uniformly to
+///   `store()`, `forget()`, and `purge_expired()`.
 pub struct MemoryEngine {
     // Wrapped in a `Mutex` (rather than a bare `Connection`) so a shared
     // `&self` can be used from every method instead of `&mut self`, which
@@ -245,7 +259,13 @@ impl MemoryEngine {
     }
 
     /// Fetches a memory by its ID.
+    ///
+    /// The id is parsed as a UUID *before* touching SQLite -- a malformed
+    /// id is rejected with zero database work, same discipline as
+    /// `forget()`.
     pub async fn get(&self, id: &str) -> Result<Option<Memory>> {
+        let uuid = Uuid::parse_str(id)?; // MemoliteError::InvalidUuid via #[from]
+
         let conn = self
             .conn
             .lock()
@@ -253,7 +273,7 @@ impl MemoryEngine {
 
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1");
         let memory = conn
-            .query_row(&sql, params![id], row_to_memory)
+            .query_row(&sql, params![uuid.to_string()], row_to_memory)
             .optional()?;
 
         Ok(memory)
@@ -345,6 +365,16 @@ impl MemoryEngine {
     /// Removes every expired memory from SQLite and the live vector index.
     ///
     /// Returns the number of deleted rows.
+    ///
+    /// Boundary convention: `expires_at <= now` counts as expired, same as
+    /// every other expiration check in this file (recall filtering,
+    /// reconciliation).
+    ///
+    /// Error convention: identical to `forget()` -- if a vector-store
+    /// delete fails, this makes a best-effort attempt to bring the index
+    /// back in sync via `reconcile_vector_index`, but the *original*
+    /// vector-store error is always what gets returned (never silently
+    /// upgraded to `Ok` just because reconciliation happened to succeed).
     pub async fn purge_expired(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
 
@@ -356,7 +386,7 @@ impl MemoryEngine {
 
             let mut stmt = conn.prepare(
                 "DELETE FROM memories
-                 WHERE expires_at IS NOT NULL AND expires_at < ?1
+                 WHERE expires_at IS NOT NULL AND expires_at <= ?1
                  RETURNING id",
             )?;
 
@@ -387,26 +417,37 @@ impl MemoryEngine {
         }
 
         if !vector_errors.is_empty() {
+            let combined = vector_errors.join("; ");
             if let Err(reconcile_error) =
                 reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
             {
                 return Err(MemoliteError::CompensationFailed {
-                    operation: vector_errors.join("; "),
+                    operation: combined,
                     compensation: reconcile_error.to_string(),
                 });
             }
+            // Reconciliation repaired the index, but per the compensation
+            // convention the original failure is still surfaced -- a
+            // successful best-effort repair never turns a real error into
+            // `Ok`.
+            return Err(MemoliteError::VectorStore(combined));
         }
 
         Ok(deleted_ids.len())
     }
 }
 
-/// Reads every memory row and, via a LEFT JOIN, every embedding row that
-/// should exist for it. A NULL on the embedding side means a memory row
-/// exists with no embedding -- since `store()` always writes both in one
-/// SQLite transaction, this is only reachable via external corruption of
-/// the file, and is reported as such rather than silently dropped from the
-/// index.
+/// Reads every *active* memory row -- not superseded, not expired -- and,
+/// via a LEFT JOIN, every embedding row that should exist for it. A NULL on
+/// the embedding side means a memory row exists with no embedding -- since
+/// `store()` always writes both in one SQLite transaction, this is only
+/// reachable via external corruption of the file, and is reported as such
+/// rather than silently dropped from the index. The active-only filter
+/// narrows *which* rows are considered; it never changes that corruption
+/// detection outcome for whatever rows do match.
+///
+/// Expiration boundary: `expires_at <= now` is expired, same convention as
+/// `purge_expired()` and recall filtering.
 ///
 /// `BackfillPolicy::ExistingOnly` returns immediately, before reading
 /// anything: "do not touch the remote store" means zero local work too,
@@ -424,6 +465,8 @@ async fn reconcile_vector_index(
         return Ok(());
     }
 
+    let now = Utc::now().timestamp();
+
     let entries: Vec<VectorEntry> = {
         let conn = conn
             .lock()
@@ -431,9 +474,11 @@ async fn reconcile_vector_index(
 
         let mut stmt = conn.prepare(
             "SELECT m.id, e.vector, e.dimension, m.metadata
-             FROM memories m LEFT JOIN embeddings e ON e.memory_id = m.id",
+             FROM memories m LEFT JOIN embeddings e ON e.memory_id = m.id
+             WHERE m.superseded_by IS NULL
+               AND (m.expires_at IS NULL OR m.expires_at > ?1)",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![now], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<Vec<u8>>>(1)?,
