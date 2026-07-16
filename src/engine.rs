@@ -246,16 +246,154 @@ impl MemoryEngine {
         Ok(id_str)
     }
 
-    /// Retrieves memories relevant to the supplied query.
+    /// Retrieves memories relevant to the supplied query, using cosine
+    /// similarity over embeddings.
     ///
-    /// Semantic retrieval is not implemented yet -- lands in M4's
-    /// `recall_query()`, with `recall()` becoming a thin wrapper around it.
-    /// Left as a stub here on purpose: wiring this to types that don't
-    /// exist yet (`RecallQuery`, `recall_query()`) would break the Step 0
-    /// checkpoint.
+    /// This is M3's real (temporary) semantic recall: it embeds `query`,
+    /// searches the live vector index for nearest neighbors, batch-loads the
+    /// matching rows from SQLite (the durable source of truth) while
+    /// filtering out expired and superseded memories in the same query,
+    /// truncates to [`crate::recall::DEFAULT_RECALL_LIMIT`] *before* any
+    /// stats mutation, bumps `access_count`/`last_accessed` for exactly that
+    /// truncated set in one transaction, and batch-refetches so the returned
+    /// `Memory` values reflect the bump this very call made -- never
+    /// pre-increment values.
+    ///
+    /// A candidate the vector index still has but that SQLite no longer has
+    /// (e.g. a partially-failed concurrent `forget()`) is silently dropped
+    /// from the result, never an error.
+    ///
+    /// **M4 transition:** M4 introduces `RecallQuery`/`recall_query()` with
+    /// richer filtering, ranking, and decay. At that point this method
+    /// becomes a thin wrapper: `recall(q) == recall_query(RecallQuery::new(q))`.
+    /// Whether the current string-based signature is kept as-is or renamed
+    /// alongside `recall_query()` is undecided and will be settled in M4 --
+    /// this comment does not promise callers of `recall()` won't need to
+    /// change.
+    ///
+    /// **Accepted failure window:** if the batch refetch (the last step)
+    /// errors, the access-stat bump from the prior step has *already been
+    /// committed* to SQLite, even though this call still returns `Err`.
+    /// Achieving full exactly-once semantics across bump+refetch would
+    /// require holding a transaction open across an `.await` boundary, which
+    /// conflicts with this file's drop-lock-before-await rule. Documented
+    /// here rather than silently accepted.
     pub async fn recall(&self, query: &str) -> Result<Vec<Memory>> {
-        let _ = query;
-        todo!("wired to recall_query() in M4")
+        if query.trim().is_empty() {
+            return Err(MemoliteError::InvalidArgument(
+                "query must not be empty".into(),
+            ));
+        }
+
+        // Embed the query. Lock the embedder only for the synchronous
+        // embed() call and drop the guard before anything else -- same
+        // discipline as store()'s use of the embedder.
+        let query_vector = {
+            let mut embedder = self
+                .embedder
+                .lock()
+                .map_err(|_| MemoliteError::Internal("embedder mutex poisoned".into()))?;
+            embedder.embed(query)?
+        };
+
+        // Clone the vector-store handle, drop the read guard, THEN await.
+        let store = {
+            let guard = self
+                .vector_store
+                .read()
+                .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
+            Arc::clone(&*guard)
+        };
+
+        let pool_size = crate::recall::candidate_pool_size(crate::recall::DEFAULT_RECALL_LIMIT);
+        let hits = store.search(&query_vector, pool_size).await?;
+
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
+        let now = Utc::now();
+
+        // One batch query for every candidate, with the expired/superseded
+        // filter applied in SQL itself -- same active-row convention used
+        // by reconcile_vector_index and purge_expired. A candidate id the
+        // vector store returned but that no longer exists (or no longer
+        // qualifies) in SQLite is simply absent from `by_id`; it is not an
+        // error, just silently dropped from this call's results.
+        let by_id = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+            fetch_active_memories(&conn, &hit_ids, now)?
+        }; // conn guard dropped here, before anything below
+
+        // Preserve the vector store's similarity order, keeping only
+        // candidates that survived the SQL-side filtering above, then
+        // truncate to the recall limit *before* any stats mutation.
+        let mut ordered_ids: Vec<Uuid> = hit_ids
+            .into_iter()
+            .filter(|id| by_id.contains_key(id))
+            .collect();
+        ordered_ids.truncate(crate::recall::DEFAULT_RECALL_LIMIT);
+
+        if ordered_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Bump access stats for exactly the truncated set, in one
+        // transaction, then drop the guard before refetching.
+        {
+            let mut conn = self
+                .conn
+                .lock()
+                .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+            let tx = conn.transaction()?;
+            let now_ts = now.timestamp();
+
+            // ?1 is now_ts; ?2.. are the id placeholders, one per id.
+            let id_placeholders = (0..ordered_ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed = ?1 \
+                 WHERE id IN ({id_placeholders})"
+            );
+
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_ts)];
+            for id in &ordered_ids {
+                params_vec.push(Box::new(id.to_string()));
+            }
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            tx.execute(&sql, params_refs.as_slice())?;
+            tx.commit()?;
+        } // conn guard dropped here, before the refetch below
+
+        // Batch-refetch so the returned Memory values reflect the bump this
+        // call just made -- one query, not one get() per id. Re-apply the
+        // active filter: a memory that flipped to expired/superseded
+        // between the two passes is silently dropped, not an error.
+        let refetched = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+            fetch_active_memories(&conn, &ordered_ids, Utc::now())?
+        };
+
+        let mut results = Vec::with_capacity(ordered_ids.len());
+        for id in ordered_ids {
+            if let Some(memory) = refetched.get(&id) {
+                results.push(memory.clone());
+            }
+            // A memory that stopped qualifying between the bump and the
+            // refetch (e.g. it expired in the interim) is dropped silently.
+        }
+
+        Ok(results)
     }
 
     /// Fetches a memory by its ID.
@@ -360,8 +498,6 @@ impl MemoryEngine {
         Ok(())
     }
 
-   
-
     /// Removes every expired memory from SQLite and the live vector index.
     ///
     /// Returns the number of deleted rows.
@@ -435,6 +571,57 @@ impl MemoryEngine {
 
         Ok(deleted_ids.len())
     }
+}
+
+/// Batch-loads every *active* (not expired, not superseded) memory in `ids`
+/// from SQLite in one query, keyed by id.
+///
+/// Used twice by `recall()`: once for the initial candidate set, once for
+/// the post-bump refetch -- both call sites need "give me exactly these
+/// ids, but only the ones still eligible" with a single round trip, not one
+/// `query_row` per id. An id present in `ids` but absent from the returned
+/// map (because no such row exists, or it no longer qualifies) is simply
+/// not a key in the map -- never an error; the caller decides what "missing"
+/// means for its own step.
+///
+/// Same expiration boundary as everywhere else in this file: `expires_at <=
+/// now` is expired.
+fn fetch_active_memories(
+    conn: &Connection,
+    ids: &[Uuid],
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, Memory>> {
+    let mut result = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(result);
+    }
+
+    // ?1 is `now`; ?2.. are one placeholder per id.
+    let id_placeholders = (0..ids.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {MEMORY_COLUMNS} FROM memories \
+         WHERE id IN ({id_placeholders}) \
+           AND superseded_by IS NULL \
+           AND (expires_at IS NULL OR expires_at > ?1)"
+    );
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.timestamp())];
+    for id in ids {
+        params_vec.push(Box::new(id.to_string()));
+    }
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), row_to_memory)?;
+    for row in rows {
+        let memory = row?;
+        result.insert(memory.id, memory);
+    }
+
+    Ok(result)
 }
 
 /// Reads every *active* memory row -- not superseded, not expired -- and,

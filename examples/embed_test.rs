@@ -51,10 +51,13 @@ fn main() -> Result<()> {
 
     println!("Cosine Similarities");
     println!("===================");
-    println!("Rust vs Rust-related : {:.4}", rust_pair);
-    println!("Rust vs Weather      : {:.4}", rust_weather);
-    println!("Rust vs Pizza        : {:.4}", rust_pizza);
-    println!("Weather vs Pizza     : {:.4}", weather_pizza);
+   
+   
+   println!("Rust vs Rust-related : {rust_pair:.4}");
+   println!("Rust vs Weather      : {rust_weather:.4}");
+   println!("Rust vs Pizza        : {rust_pizza:.4}");
+   println!("Weather vs Pizza     : {weather_pizza:.4}");
+
 
     println!("\nExpected:");
     println!("  Rust vs Rust-related should be the highest.");
