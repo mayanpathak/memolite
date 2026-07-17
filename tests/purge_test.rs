@@ -5,24 +5,24 @@
 //! through the public API. Instead we open a second raw `rusqlite`
 //! connection to the same database file and insert a row directly with an
 //! `expires_at` timestamp in the past, then confirm `purge_expired()`
-//! removes it.
+//! removes it. The database file itself is managed by `TempDb` (Phase 7,
+//! Step 45) instead of a manual `std::fs::remove_file` tail call.
+
+mod common;
 
 use chrono::{Duration, Utc};
+use common::TempDb;
 use memolite::{MemoryEngine, MemoryType};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
-fn temp_db_path(test_name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("memolite-test-{test_name}-{}.db", Uuid::new_v4()))
-}
-
 #[tokio::test]
 async fn purge_expired_deletes_only_expired_memories() {
-    let path = temp_db_path("purge");
+    let db = TempDb::new("purge");
 
     // Opening the engine first creates the `memories` table via its
     // CREATE TABLE IF NOT EXISTS migration.
-    let engine = MemoryEngine::open(&path)
+    let engine = MemoryEngine::open(db.path())
         .await
         .expect("failed to open engine");
 
@@ -40,7 +40,7 @@ async fn purge_expired_deletes_only_expired_memories() {
     let past_expiry = (now - Duration::hours(1)).timestamp();
 
     {
-        let raw_conn = Connection::open(&path).expect("failed to open raw connection");
+        let raw_conn = Connection::open(db.path()).expect("failed to open raw connection");
         raw_conn
             .execute(
                 r#"
@@ -87,7 +87,5 @@ async fn purge_expired_deletes_only_expired_memories() {
     let live_after = engine.get(&live_id).await.expect("get() failed");
     assert!(live_after.is_some());
 
-    // Explicitly drop engine before removing the file
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
+    // No manual cleanup needed -- `db` removes the file when it drops.
 }

@@ -10,6 +10,9 @@ Unlike the last two passes, this one was actually run: `cargo test` was executed
 (Windows, real SQLite/ONNX toolchain) and the results are pasted in §3 below, including one real
 bug it caught.
 
+A second pass, covering **Phase 7** (corruption tests + hygiene), was added later the same day —
+see §6 onward.
+
 ---
 
 ## 1. What we found before writing anything
@@ -145,7 +148,7 @@ machine) catches things line-by-line manual review can't.
 
 ---
 
-## 4. What's explicitly still outstanding
+## 4. What's explicitly still outstanding (as of the Phase 4 pass)
 
 - **Re-run `cargo test` after the `orphan_test.rs` fix** to confirm the pragma change actually
   resolves the failure (expected to pass, not yet re-confirmed against the real toolchain in this
@@ -160,7 +163,7 @@ machine) catches things line-by-line manual review can't.
 
 ---
 
-## 5. Files touched this pass
+## 5. Files touched this pass (Phase 4)
 
 1. `tests/cosine_test.rs` — **new**, 5 tests.
 2. `tests/module_test.rs` — **new**, 1 test.
@@ -178,3 +181,143 @@ machine) catches things line-by-line manual review can't.
 `tests/compensation_test.rs`, `tests/open_with_store_test.rs` — their required coverage exists
 in-crate instead, for reasons the plan's own file list didn't account for (`pub(crate)` and
 private-field visibility).
+
+---
+
+---
+
+## 6. Addendum (same day) — Phase 7: Corruption Tests + Hygiene
+
+Closes the two items §4 explicitly left outstanding from the checklist: the malformed-data
+corruption suite, and the `TempDb` RAII cleanup helper (`ARCHITECTURE.md` and the final gate run
+are still open — see §9).
+
+This addendum's changes were reviewed against the real file-by-file contents of `src/engine.rs`,
+`src/error.rs`, `src/migrations.rs`, `src/vector_store/mod.rs`, `src/vector_store/in_memory.rs`,
+and `tests/common/mod.rs` on `main` before writing anything, same discipline as §1 — and it
+surfaced the same category of plan-vs-repo drift the Phase 4 pass did, on the checklist's Step 41.
+
+### 6.1 What we found before writing anything
+
+- Same `pub(crate)` constraint from §1 applies again, this time to one specific corruption
+  scenario: the checklist's Step 41 ("dimension vs backend mismatch → `Err(InvalidArgument)`")
+  is exactly the check `open_with_store_internal` does when a caller-supplied `VectorStore`'s
+  `dimension()` disagrees with the embedder's real dimension. `MemoryEngine::open()` — the only
+  constructor a `tests/` file can reach — always builds its own `InMemoryVectorStore` sized to
+  match the embedder, so there is no public path to that branch at all.
+- That exact scenario is already covered, and has been since the Phase 4 pass (§2.8): the
+  in-crate test `open_with_store_rejects_a_dimension_mismatched_backend` in
+  `src/engine.rs`. Nothing new needed there.
+- The other three checklist items (invalid bincode blob, a row's `dimension` column disagreeing
+  with its own decoded vector length, and a non-finite float smuggled into an otherwise
+  well-formed blob) are all real, externally-triggerable states — `store()` can never produce any
+  of them itself, but a raw `rusqlite::Connection` hand-editing a row `store()` already wrote can,
+  exactly like `tests/orphan_test.rs` and `tests/restart_test.rs` already do for their own
+  scenarios. All three go through `MemoryEngine::open()` → `reconcile_vector_index()`, and none of
+  them requires touching a `pub(crate)` item.
+
+**Consequence, called out the same way §1 called out its two omissions:** the checklist's Step 41
+is not a separate test in `tests/corruption_test.rs`. Duplicating it there wasn't possible (it
+won't compile against `pub(crate)` from outside the crate) and duplicating it in-crate would just
+be the same test twice under a different name. `tests/corruption_test.rs`'s own doc comment says
+this explicitly, pointing at the existing unit test by name, so the omission is documented at the
+point someone would actually go looking for it — not just here.
+
+### 6.2 What was added, file by file
+
+#### `tests/common/mod.rs` — appended
+
+Added `TempDb`: an RAII guard that reserves a unique path under `std::env::temp_dir()` on
+construction (creating nothing on disk yet) and removes that file, unconditionally, when dropped.
+This is what every existing integration test's tail-end `std::fs::remove_file(&path).expect(...)`
+call was missing — that line only ever ran on a clean, non-panicking exit, so any test that failed
+an `assert!`/`expect()` earlier in its body left its `.db` file behind in the OS temp dir forever.
+`Drop::drop` runs regardless of *why* the guard's scope ended, panic included, which a manual tail
+call structurally cannot do. Added one self-test (`temp_db_removes_its_file_on_drop`) proving the
+guard actually deletes the file, not just that it compiles. Module doc comment updated to describe
+three fixtures instead of two.
+
+#### `tests/corruption_test.rs` — new, 3 tests
+
+- `invalid_bincode_blob_fails_open_without_panicking` — overwrites `embeddings.vector` with 6
+  garbage bytes (too short to even hold bincode's own 8-byte length prefix, so this is guaranteed
+  to be a decode error rather than an accidental, nonsensical-but-valid decode) → asserts
+  `Err(MemoliteError::EmbeddingDecode(_))`. The test passing at all — reaching the assertion
+  instead of aborting on a panic — is itself part of what proves "no panic."
+- `dimension_column_disagreeing_with_decoded_vector_length_is_corruption` — leaves the vector blob
+  itself untouched (still decodes to a real, finite vector) but bumps the row's own `dimension`
+  column by one → asserts `Err(MemoliteError::Corruption(_))`, exercising the exact
+  `vector.len() != stored_dim` self-consistency check in `reconcile_vector_index`, one layer
+  before anything reaches the backend.
+- `non_finite_value_in_stored_vector_is_rejected_on_reconciliation` — reads the real embedder's
+  dimension via the already-public `MemoryEngine::dimension()`, writes a correctly-sized vector
+  with one component replaced by `f32::NAN`, re-serializes it with `bincode::serialize` the same
+  way `store()` does → asserts the reopen is `Err`. This one is *not* caught by
+  `reconcile_vector_index` itself (it has no finiteness check of its own); it's caught one layer
+  down, by `InMemoryVectorStore::replace_all`'s existing `validate_vector` call — which is exactly
+  the documented "engine trusts the backend to validate" contract on the `VectorStore` trait, doing
+  its job.
+
+All three use `TempDb` from the moment the file was created — there was never a manual
+`temp_db_path`/`remove_file` version of this file to migrate away from.
+
+#### `tests/crud_test.rs`, `tests/purge_test.rs`, `tests/forget_test.rs`, `tests/restart_test.rs` — edited
+
+Every test that opened a real file on disk now does `let db = TempDb::new("...")` and
+`MemoryEngine::open(db.path())` instead of the old `temp_db_path("...")` helper, and the trailing
+`drop(engine); std::fs::remove_file(&path).expect(...)` two-liner at the end of each test body is
+gone — Rust's own drop order (locals drop in reverse declaration order, so `db` — declared first —
+drops *after* `engine`) already guarantees the engine's file handle is released before `TempDb`
+tries to remove the file, without an explicit `drop(engine)` needing to be added anywhere it wasn't
+already there for some other reason. `forget_test.rs`'s two tests that open the engine against
+`:memory:` were left untouched — there's no file for `TempDb` to manage in either case.
+
+No behavior changed in any of these four files; every assertion is identical to before. This is a
+pure mechanical migration, same as the plan's own framing of it ("hygiene," not new coverage).
+
+### 6.3 Test run
+
+Not executed this addendum — no Rust toolchain (`cargo`) was available in the sandbox this pass
+was written in, unlike the Phase 4 pass's real Windows run in §3. Every choice above was checked
+by hand against the actual code paths in `src/engine.rs`, `src/error.rs`, and
+`src/vector_store/{mod.rs,in_memory.rs}` (which error variant each corrupted state actually
+produces, in what order the checks run, that `bincode`, `chrono`, `rusqlite`, and `uuid` are all
+already `[dependencies]` and therefore usable from `tests/` without a `Cargo.toml` change) rather
+than by running it. **Running `cargo test`, `cargo clippy --all-targets -- -D warnings`, and
+`cargo fmt --check` against this addendum's five files on a real toolchain is the first thing the
+next pass should do** — same category of risk §3 already demonstrated once this milestone (a
+plan-level assumption that held everywhere reviewed by hand except the one place a real run caught
+it).
+
+### 6.4 What's explicitly still outstanding (updated)
+
+- **Run the real toolchain against this addendum** (see §6.3) — not yet done.
+- **`ARCHITECTURE.md`** — still not written. Should capture the five Phase-1 conventions (
+  expiration boundary, compensation policy, `VectorStore` ID type, orphan-detection mechanism,
+  `open_with_store` visibility) plus the "Known Limitations" list, per the original plan.
+- **Final milestone gate** — unchanged from §4: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets` all
+  green in one clean run, plus the full re-check of every item from the original 32-point review
+  (and the 9 follow-up refinements) against the final code, with each marked resolved or
+  explicitly deferred.
+- **Re-run confirmation from §3/§4** — the `orphan_test.rs` FK-pragma fix from the Phase 4 pass
+  still has not been re-confirmed against a real toolchain run; this addendum did not touch that
+  file, so the same open item carries forward unchanged.
+
+### 6.5 Files touched this addendum
+
+1. `tests/common/mod.rs` — **appended**: `TempDb` struct + `Drop` impl + 1 self-test; module doc
+   comment updated.
+2. `tests/corruption_test.rs` — **new**, 3 tests.
+3. `tests/crud_test.rs` — **edited**: `TempDb` in place of `temp_db_path`/manual `remove_file`,
+   no behavior change.
+4. `tests/purge_test.rs` — **edited**: same mechanical change, no behavior change.
+5. `tests/forget_test.rs` — **edited**: same mechanical change (one test only — the other two use
+   `:memory:`), no behavior change.
+6. `tests/restart_test.rs` — **edited**: same mechanical change, no behavior change.
+7. `Changelogs/18july.md` — this addendum.
+
+**Explicitly not created, and correctly so, per §6.1:** a fourth `tests/corruption_test.rs` case
+for the checklist's Step 41 — its coverage already exists in-crate
+(`open_with_store_rejects_a_dimension_mismatched_backend`, added in the Phase 4 pass, §2.8) for
+the same `pub(crate)`-visibility reason §1 already established this milestone.

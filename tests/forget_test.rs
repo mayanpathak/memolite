@@ -3,21 +3,24 @@
 //! malformed-id rejection with zero side effects, no-op on a well-formed
 //! but missing id, and (indirectly, via `recall()`, since the live vector
 //! index isn't part of the public API) removal from the vector store too.
+//!
+//! The one test here that touches a real file on disk uses `TempDb`
+//! (Phase 7, Step 46) instead of a manual `std::fs::remove_file` tail call.
+//! The other two open the engine against `:memory:`, so there is no file to
+//! clean up at all.
 
+mod common;
+
+use common::TempDb;
 use memolite::{MemoliteError, MemoryEngine, MemoryType};
 use uuid::Uuid;
 
-fn temp_db_path(test_name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "memolite-forget-test-{test_name}-{}.db",
-        Uuid::new_v4()
-    ))
-}
-
 #[tokio::test]
 async fn forget_rejects_a_malformed_id_with_zero_side_effects() {
-    let path = temp_db_path("malformed");
-    let engine = MemoryEngine::open(&path).await.expect("engine should open");
+    let db = TempDb::new("malformed");
+    let engine = MemoryEngine::open(db.path())
+        .await
+        .expect("engine should open");
 
     let id = engine
         .store(
@@ -40,8 +43,7 @@ async fn forget_rejects_a_malformed_id_with_zero_side_effects() {
             .is_some()
     );
 
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
+    // No manual cleanup needed -- `db` removes the file when it drops.
 }
 
 #[tokio::test]

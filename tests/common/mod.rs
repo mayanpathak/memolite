@@ -4,7 +4,7 @@
 //! `cargo test` does NOT treat it as its own standalone test binary --
 //! it's only compiled when a real test file does `mod common;`.
 //!
-//! Two fixtures live here:
+//! Three fixtures live here:
 //!
 //! - [`FakeVectorStore`]: a deterministic `VectorStore` test double with
 //!   forced-failure switches, used everywhere a test needs to prove the
@@ -16,6 +16,13 @@
 //!   It exists for building test vectors cheaply, without loading the real
 //!   ONNX model, wherever a test needs *some* vector and doesn't care that
 //!   it carries real semantic meaning.
+//! - [`TempDb`]: an RAII guard around a throwaway SQLite file. Replaces the
+//!   old pattern of a `temp_db_path()` helper plus a manual
+//!   `std::fs::remove_file(&path)` at the very end of a test body -- a
+//!   manual cleanup call never runs if an earlier `assert!`/`expect()` in
+//!   the same test panics, so failed tests were silently leaving `.db`
+//!   files behind in the OS temp dir. Dropping `TempDb` removes the file
+//!   unconditionally, panic or not (Phase 7, Step 43).
 //!
 //! Every test file that wants these must start with `mod common;`.
 
@@ -290,6 +297,65 @@ impl FakeEmbedder {
     }
 }
 
+/// RAII guard around a throwaway SQLite file used by an integration test.
+///
+/// `TempDb::new(test_name)` picks a unique path under `std::env::temp_dir()`
+/// tagged with `test_name` -- nothing is created on disk yet; that happens
+/// the first time something (typically `MemoryEngine::open`) opens the
+/// path. Whenever the guard is dropped -- normal end of test, early
+/// `return`, or an `assert!`/`expect()` panic partway through -- its `Drop`
+/// impl removes the file. This replaces every test's old hand-written
+/// `std::fs::remove_file(&path).expect(...)` tail call, which only ran on a
+/// clean, non-panicking exit and therefore left files behind on any test
+/// failure.
+///
+/// Usage:
+/// ```ignore
+/// let db = TempDb::new("my-test");
+/// let engine = MemoryEngine::open(db.path()).await.unwrap();
+/// // ... use engine ...
+/// // no manual cleanup needed -- `db` removes the file when it drops.
+/// ```
+///
+/// If a test needs the engine's file handle released before doing more
+/// work against the same path (e.g. opening a second raw `Connection`, or
+/// reopening via `MemoryEngine::open` again), it still needs an explicit
+/// `drop(engine)` at that point -- `TempDb` only controls the *file*, not
+/// how long the `MemoryEngine` holding it stays alive.
+pub struct TempDb {
+    path: std::path::PathBuf,
+}
+
+impl TempDb {
+    /// Builds a unique, not-yet-existing path under the OS temp dir. The
+    /// `test_name` tag is purely for readability if a leftover file is ever
+    /// inspected by hand; a random UUID guarantees no collision between
+    /// parallel `cargo test` runs even when several tests pass the same
+    /// `test_name`.
+    pub fn new(test_name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "memolite-test-{test_name}-{}.db",
+            Uuid::new_v4()
+        ));
+        Self { path }
+    }
+
+    /// The path this guard owns, for passing straight into
+    /// `MemoryEngine::open` or `rusqlite::Connection::open`.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        // Best-effort: the file may never have been created (e.g. the test
+        // failed before `MemoryEngine::open` ran), so a missing-file error
+        // here is not itself a problem worth failing the test over.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod fixture_self_tests {
     use super::*;
@@ -362,5 +428,19 @@ mod fixture_self_tests {
         let a = embedder.embed("alpha").unwrap();
         let b = embedder.embed("beta").unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn temp_db_removes_its_file_on_drop() {
+        let path = {
+            let db = TempDb::new("self-test");
+            std::fs::write(db.path(), b"placeholder").unwrap();
+            assert!(db.path().exists());
+            db.path().to_path_buf()
+        }; // db dropped here
+        assert!(
+            !path.exists(),
+            "TempDb must remove its file when dropped"
+        );
     }
 }

@@ -1,114 +1,128 @@
 //! CRUD integration tests for `MemoryEngine`.
 //!
-//! These tests only touch the public API (`open`, `store`, `get`, `forget`)
-//! exactly the way a real user of the crate would rather than reaching into
-//! internals. Each test opens its own throwaway SQLite file so tests don't
-//! interfere with each other when run in parallel.
+//! These tests exercise only the public API (`open`, `store`, `get`,
+//! `forget`) exactly as downstream users would.
+//!
+//! Every test creates its own temporary SQLite database through `TempDb`,
+//! making the suite safe to run in parallel while ensuring automatic cleanup
+//! even if a test panics.
 
+mod common;
+
+use common::TempDb;
 use memolite::{MemoryEngine, MemoryType};
-use uuid::Uuid;
 
-/// Builds a unique path in the OS temp dir for each test run, so parallel
-/// `cargo test` runs don't collide on the same `.db` file.
-fn temp_db_path(test_name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "context-memory-test-{test_name}-{}.db",
-        Uuid::new_v4()
-    ))
-}
-
-/// Test 1: store a memory, then get() it back, and assert the content matches.
+/// Test 1: store a memory, then retrieve it and verify every important field.
 #[tokio::test]
 async fn store_then_get_returns_matching_memory() {
-    let path = temp_db_path("store-get");
-    let engine = MemoryEngine::open(&path)
+    let db = TempDb::new("store-get");
+
+    let engine = MemoryEngine::open(db.path())
         .await
         .expect("failed to open engine");
 
-    // Store a memory and keep the returned ID.
+    // Store a memory.
     let id = engine
-        .store("Rust is my favorite language", MemoryType::Semantic, 0.9)
+        .store(
+            "Rust is my favorite language",
+            MemoryType::Semantic,
+            0.9,
+        )
         .await
         .expect("store() failed");
 
-    // Fetch it back by that ID.
+    // Retrieve it.
     let fetched = engine
         .get(&id)
         .await
         .expect("get() failed")
-        .expect("expected Some(memory), got None");
+        .expect("expected stored memory");
 
-    // The content we stored should come back unchanged.
     assert_eq!(fetched.content, "Rust is my favorite language");
     assert_eq!(fetched.memory_type, MemoryType::Semantic);
     assert_eq!(fetched.importance, 0.9);
     assert_eq!(fetched.id.to_string(), id);
 
-    // Explicitly drop engine before removing the file.
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
+    // TempDb automatically removes the database file.
 }
 
-/// Test 2: forget() a memory, then get() it, and assert it returns None.
+/// Test 2: forget() removes an existing memory.
 #[tokio::test]
 async fn forget_removes_the_memory() {
-    let path = temp_db_path("forget");
-    let engine = MemoryEngine::open(&path)
+    let db = TempDb::new("forget");
+
+    let engine = MemoryEngine::open(db.path())
         .await
         .expect("failed to open engine");
 
-    // Store something first so there's a real memory to forget.
     let id = engine
-        .store("temporary note", MemoryType::Working, 0.2)
+        .store(
+            "temporary note",
+            MemoryType::Working,
+            0.2,
+        )
         .await
         .expect("store() failed");
 
-    // Sanity check: it exists before we forget it.
-    assert!(engine.get(&id).await.expect("get() failed").is_some());
+    assert!(
+        engine
+            .get(&id)
+            .await
+            .expect("get() failed")
+            .is_some()
+    );
 
-    // Delete it.
-    engine.forget(&id).await.expect("forget() failed");
+    engine
+        .forget(&id)
+        .await
+        .expect("forget() failed");
 
-    // It should no longer be retrievable.
-    let fetched = engine.get(&id).await.expect("get() failed");
+    let fetched = engine
+        .get(&id)
+        .await
+        .expect("get() failed");
+
     assert!(fetched.is_none());
-
-    // Explicitly drop engine before removing the file.
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }
 
-/// Test 3: store() rejects empty/whitespace-only content.
+/// Test 3: store() rejects empty or whitespace-only content.
 #[tokio::test]
 async fn store_rejects_empty_content_via_public_api() {
-    let path = temp_db_path("empty-content");
-    let engine = MemoryEngine::open(&path)
+    let db = TempDb::new("empty-content");
+
+    let engine = MemoryEngine::open(db.path())
         .await
         .expect("failed to open engine");
 
     let result = engine
-        .store("   ", MemoryType::Working, 0.5)
+        .store(
+            "   ",
+            MemoryType::Working,
+            0.5,
+        )
         .await;
 
     assert!(matches!(
         result,
         Err(memolite::MemoliteError::InvalidArgument(_))
     ));
-
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }
 
-/// Test 4: store() rejects importance outside [0.0, 1.0].
+/// Test 4: store() rejects importance outside the valid [0.0, 1.0] range.
 #[tokio::test]
 async fn store_rejects_importance_outside_zero_to_one() {
-    let path = temp_db_path("bad-importance");
-    let engine = MemoryEngine::open(&path)
+    let db = TempDb::new("bad-importance");
+
+    let engine = MemoryEngine::open(db.path())
         .await
         .expect("failed to open engine");
 
     let too_high = engine
-        .store("valid content", MemoryType::Working, 1.5)
+        .store(
+            "valid content",
+            MemoryType::Working,
+            1.5,
+        )
         .await;
 
     assert!(matches!(
@@ -117,23 +131,25 @@ async fn store_rejects_importance_outside_zero_to_one() {
     ));
 
     let too_low = engine
-        .store("valid content", MemoryType::Working, -0.1)
+        .store(
+            "valid content",
+            MemoryType::Working,
+            -0.1,
+        )
         .await;
 
     assert!(matches!(
         too_low,
         Err(memolite::MemoliteError::InvalidArgument(_))
     ));
-
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }
 
-/// Test 5: each `MemoryType` gets its documented default TTL.
+/// Test 5: every MemoryType receives its documented default TTL.
 #[tokio::test]
 async fn stored_memory_gets_the_correct_ttl_for_its_type() {
-    let path = temp_db_path("ttl");
-    let engine = MemoryEngine::open(&path)
+    let db = TempDb::new("ttl");
+
+    let engine = MemoryEngine::open(db.path())
         .await
         .expect("failed to open engine");
 
@@ -143,7 +159,11 @@ async fn stored_memory_gets_the_correct_ttl_for_its_type() {
         (MemoryType::Procedural, 730),
     ] {
         let id = engine
-            .store("ttl check", memory_type, 0.5)
+            .store(
+                "ttl check",
+                memory_type,
+                0.5,
+            )
             .await
             .expect("store() failed");
 
@@ -155,7 +175,7 @@ async fn stored_memory_gets_the_correct_ttl_for_its_type() {
 
         let expires_at = memory
             .expires_at
-            .expect("this memory type always sets expires_at");
+            .expect("memory type should have an expiration");
 
         assert_eq!(
             (expires_at - memory.created_at).num_days(),
@@ -165,7 +185,11 @@ async fn stored_memory_gets_the_correct_ttl_for_its_type() {
 
     // Working memories use an hours-based TTL.
     let id = engine
-        .store("working ttl check", MemoryType::Working, 0.5)
+        .store(
+            "working ttl check",
+            MemoryType::Working,
+            0.5,
+        )
         .await
         .expect("store() failed");
 
@@ -177,13 +201,10 @@ async fn stored_memory_gets_the_correct_ttl_for_its_type() {
 
     let expires_at = memory
         .expires_at
-        .expect("Working memories always set expires_at");
+        .expect("Working memories should have an expiration");
 
     assert_eq!(
         (expires_at - memory.created_at).num_hours(),
         4
     );
-
-    drop(engine);
-    std::fs::remove_file(&path).expect("failed to remove temp db file");
 }
