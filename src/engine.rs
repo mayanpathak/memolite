@@ -1049,4 +1049,102 @@ mod tests {
         drop(conn);
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
+ /// A `VectorStore` test double whose `delete` always fails, used to
+    /// prove `forget()`'s error-surfacing convention (Step 17/41): the
+    /// *original* vector-store error is returned even after a successful
+    /// best-effort `reconcile_vector_index` repair.
+    struct AlwaysFailsDelete;
+ 
+    #[async_trait]
+    impl VectorStore for AlwaysFailsDelete {
+        async fn insert(
+            &self,
+            _id: Uuid,
+            _vector: &[f32],
+            _metadata: HashMap<String, serde_json::Value>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn search(&self, _query: &[f32], _k: usize) -> Result<Vec<VectorHit>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, _id: Uuid) -> Result<()> {
+            Err(MemoliteError::VectorStore("simulated delete failure".into()))
+        }
+        async fn contains(&self, _id: Uuid) -> Result<bool> {
+            Ok(false)
+        }
+        async fn replace_all(&self, _entries: Vec<VectorEntry>) -> Result<()> {
+            // Reconciliation itself succeeds trivially here, so the test
+            // below proves forget() still surfaces the *original* delete
+            // error rather than upgrading a successful repair into `Ok`.
+            Ok(())
+        }
+        fn dimension(&self) -> usize {
+            384 // matches Embedder::dimension()
+        }
+    }
+ 
+    #[tokio::test]
+    async fn forget_surfaces_the_original_error_when_vector_delete_fails() {
+        let path = std::env::temp_dir()
+            .join(format!("memolite-step0-forget-compensate-{}.db", Uuid::new_v4()));
+ 
+        let engine = MemoryEngine::open_with_store_internal(
+            &path,
+            Some(Arc::new(AlwaysFailsDelete) as Arc<dyn VectorStore>),
+            BackfillPolicy::ExistingOnly,
+        )
+        .await
+        .expect("engine should open even though its store's delete will fail later");
+ 
+        let id = engine
+            .store("will fail to delete from the vector store", MemoryType::Working, 0.5)
+            .await
+            .expect("store should succeed");
+ 
+        let result = engine.forget(&id).await;
+        assert!(matches!(result, Err(MemoliteError::VectorStore(_))));
+ 
+        // forget() deletes from SQLite first, regardless of what happens to
+        // the vector store afterward -- the SQLite row must be gone even
+        // though the overall call returned Err.
+        assert!(engine.get(&id).await.unwrap().is_none());
+ 
+        drop(engine);
+        std::fs::remove_file(&path).expect("failed to remove temp db file");
+    }
+ 
+    #[tokio::test]
+    async fn open_with_store_rejects_a_dimension_mismatched_backend() {
+        let path = std::env::temp_dir()
+            .join(format!("memolite-step0-dim-mismatch-{}.db", Uuid::new_v4()));
+ 
+        // The real embedder produces 384-dimensional vectors; this store is
+        // deliberately the wrong size.
+        let wrong_dim_store = Arc::new(InMemoryVectorStore::new(7)) as Arc<dyn VectorStore>;
+ 
+        let result = MemoryEngine::open_with_store_internal(
+            &path,
+            Some(wrong_dim_store),
+            BackfillPolicy::ExistingOnly,
+        )
+        .await;
+ 
+        assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
+ 
+        // open() must reject the mismatch before doing any reconciliation
+        // work, so no database file contents should have been touched in a
+        // way that matters -- just clean up whatever SQLite created.
+        let _ = std::fs::remove_file(&path);
+    }
 }
+
+
+
+
+
+
+
+
+
