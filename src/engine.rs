@@ -246,42 +246,57 @@ impl MemoryEngine {
         Ok(id_str)
     }
 
-    /// Retrieves memories relevant to the supplied query, using cosine
-    /// similarity over embeddings.
+    /// Retrieves memories relevant to the supplied query text using the
+    /// default `RecallQuery` (limit `DEFAULT_RECALL_LIMIT`, no filters,
+    /// superseded/expired excluded).
     ///
-    /// This is M3's real (temporary) semantic recall: it embeds `query`,
-    /// searches the live vector index for nearest neighbors, batch-loads the
-    /// matching rows from SQLite (the durable source of truth) while
-    /// filtering out expired and superseded memories in the same query,
-    /// truncates to [`crate::recall::DEFAULT_RECALL_LIMIT`] *before* any
-    /// stats mutation, bumps `access_count`/`last_accessed` for exactly that
-    /// truncated set in one transaction, and batch-refetches so the returned
-    /// `Memory` values reflect the bump this very call made -- never
-    /// pre-increment values.
+    /// As of M4 this is a thin wrapper around [`Self::recall_query`] --
+    /// there is exactly one bump-and-refetch code path in the crate,
+    /// defined once in `recall_query()`, not two that can drift apart.
+    pub async fn recall(&self, query: &str) -> Result<Vec<Memory>> {
+        let result = self
+            .recall_query(crate::recall::RecallQuery::new(query))
+            .await?;
+        Ok(result.items.into_iter().map(|i| i.memory).collect())
+    }
+
+    /// The full recall implementation: embed the query, search the live
+    /// vector index for nearest neighbors, batch-load and filter the
+    /// matching SQLite rows, score and rank them, truncate to
+    /// `query.limit`, then bump access stats for exactly that truncated set
+    /// and batch-refetch so the returned `Memory` values reflect the bump
+    /// this very call made -- never pre-increment values.
     ///
     /// A candidate the vector index still has but that SQLite no longer has
     /// (e.g. a partially-failed concurrent `forget()`) is silently dropped
-    /// from the result, never an error.
+    /// from the result, never an error -- same convention as M3's
+    /// `recall()`.
     ///
-    /// **M4 transition:** M4 introduces `RecallQuery`/`recall_query()` with
-    /// richer filtering, ranking, and decay. At that point this method
-    /// becomes a thin wrapper: `recall(q) == recall_query(RecallQuery::new(q))`.
-    /// Whether the current string-based signature is kept as-is or renamed
-    /// alongside `recall_query()` is undecided and will be settled in M4 --
-    /// this comment does not promise callers of `recall()` won't need to
-    /// change.
-    ///
-    /// **Accepted failure window:** if the batch refetch (the last step)
-    /// errors, the access-stat bump from the prior step has *already been
-    /// committed* to SQLite, even though this call still returns `Err`.
-    /// Achieving full exactly-once semantics across bump+refetch would
-    /// require holding a transaction open across an `.await` boundary, which
-    /// conflicts with this file's drop-lock-before-await rule. Documented
-    /// here rather than silently accepted.
-    pub async fn recall(&self, query: &str) -> Result<Vec<Memory>> {
-        if query.trim().is_empty() {
+    /// `confidence_weight` is stubbed at `1.0` here; M6 replaces that one
+    /// line with `memory.confidence.weight()` once the `confidence` column
+    /// and field exist. Nothing else in this function changes at that
+    /// point -- this is the single bump-and-refetch implementation the
+    /// crate will ever have, edited in place from here on, never
+    /// duplicated.
+    pub async fn recall_query(
+        &self,
+        query: crate::recall::RecallQuery,
+    ) -> Result<crate::recall::RecallResult> {
+        use crate::recall::{RecallItem, RecallResult};
+
+        if query.query_text.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
-                "query must not be empty".into(),
+                "query_text must not be empty".into(),
+            ));
+        }
+        if query.limit == 0 {
+            return Err(MemoliteError::InvalidArgument(
+                "limit must be > 0".into(),
+            ));
+        }
+        if !query.min_importance.is_finite() {
+            return Err(MemoliteError::InvalidArgument(
+                "min_importance must be finite".into(),
             ));
         }
 
@@ -293,7 +308,7 @@ impl MemoryEngine {
                 .embedder
                 .lock()
                 .map_err(|_| MemoliteError::Internal("embedder mutex poisoned".into()))?;
-            embedder.embed(query)?
+            embedder.embed(&query.query_text)?
         };
 
         // Clone the vector-store handle, drop the read guard, THEN await.
@@ -305,45 +320,96 @@ impl MemoryEngine {
             Arc::clone(&*guard)
         };
 
-        let pool_size = crate::recall::candidate_pool_size(crate::recall::DEFAULT_RECALL_LIMIT);
+        let pool_size = crate::recall::candidate_pool_size(query.limit);
         let hits = store.search(&query_vector, pool_size).await?;
 
         if hits.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RecallResult { items: Vec::new() });
         }
 
         let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
         let now = Utc::now();
 
-        // One batch query for every candidate, with the expired/superseded
-        // filter applied in SQL itself -- same active-row convention used
-        // by reconcile_vector_index and purge_expired. A candidate id the
-        // vector store returned but that no longer exists (or no longer
-        // qualifies) in SQLite is simply absent from `by_id`; it is not an
-        // error, just silently dropped from this call's results.
+        // One unfiltered batch query for every candidate; RecallQuery's
+        // filters (type, importance, metadata, superseded/expired
+        // inclusion) are all applied in Rust below, uniformly, rather than
+        // being split across a fixed SQL WHERE clause and ad-hoc Rust
+        // checks.
         let by_id = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-            fetch_active_memories(&conn, &hit_ids, now)?
+            fetch_memories_by_ids(&conn, &hit_ids)?
         }; // conn guard dropped here, before anything below
 
-        // Preserve the vector store's similarity order, keeping only
-        // candidates that survived the SQL-side filtering above, then
-        // truncate to the recall limit *before* any stats mutation.
-        let mut ordered_ids: Vec<Uuid> = hit_ids
-            .into_iter()
-            .filter(|id| by_id.contains_key(id))
-            .collect();
-        ordered_ids.truncate(crate::recall::DEFAULT_RECALL_LIMIT);
+        let mut scored: Vec<RecallItem> = Vec::with_capacity(hits.len());
+        for hit in &hits {
+            // A candidate the vector index has but SQLite no longer has
+            // (e.g. a partially-failed concurrent forget()) is silently
+            // dropped, never an error.
+            let Some(memory) = by_id.get(&hit.id) else {
+                continue;
+            };
 
-        if ordered_ids.is_empty() {
-            return Ok(Vec::new());
+            if memory.importance < query.min_importance {
+                continue;
+            }
+            if let Some(types) = &query.memory_types {
+                if !types.contains(&memory.memory_type) {
+                    continue;
+                }
+            }
+            if memory.superseded_by.is_some() && !query.include_superseded {
+                continue;
+            }
+            // Same expiration boundary as everywhere else in this file:
+            // expires_at <= now is expired.
+            if memory.expires_at.map(|e| e <= now).unwrap_or(false) && !query.include_expired {
+                continue;
+            }
+            if !query
+                .metadata_equals
+                .iter()
+                .all(|(k, v)| memory.metadata.get(k) == Some(v))
+            {
+                continue;
+            }
+
+            let days_since_access = (now - memory.last_accessed).num_seconds() as f64 / 86400.0;
+            let recency = crate::ranking::recency_factor(days_since_access, memory.memory_type);
+            let reinforcement = crate::ranking::reinforcement_factor(memory.access_count);
+            let confidence_weight = 1.0_f32; // M6 replaces this one line
+            let score = crate::ranking::final_score(
+                hit.score,
+                memory.importance,
+                recency,
+                reinforcement,
+                confidence_weight,
+            );
+
+            scored.push(RecallItem {
+                memory: memory.clone(),
+                similarity: hit.score,
+                score,
+            });
+        }
+
+        scored.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.memory.id.cmp(&b.memory.id))
+        });
+        scored.truncate(query.limit);
+
+        if scored.is_empty() {
+            return Ok(RecallResult { items: Vec::new() });
         }
 
         // Bump access stats for exactly the truncated set, in one
-        // transaction, then drop the guard before refetching.
+        // transaction -- same batching pattern M3's recall() used, not a
+        // per-item loop.
+        let bumped_ids: Vec<Uuid> = scored.iter().map(|i| i.memory.id).collect();
         {
             let mut conn = self
                 .conn
@@ -352,8 +418,7 @@ impl MemoryEngine {
             let tx = conn.transaction()?;
             let now_ts = now.timestamp();
 
-            // ?1 is now_ts; ?2.. are the id placeholders, one per id.
-            let id_placeholders = (0..ordered_ids.len())
+            let id_placeholders = (0..bumped_ids.len())
                 .map(|i| format!("?{}", i + 2))
                 .collect::<Vec<_>>()
                 .join(",");
@@ -363,7 +428,7 @@ impl MemoryEngine {
             );
 
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_ts)];
-            for id in &ordered_ids {
+            for id in &bumped_ids {
                 params_vec.push(Box::new(id.to_string()));
             }
             let params_refs: Vec<&dyn rusqlite::ToSql> =
@@ -372,28 +437,25 @@ impl MemoryEngine {
             tx.commit()?;
         } // conn guard dropped here, before the refetch below
 
-        // Batch-refetch so the returned Memory values reflect the bump this
-        // call just made -- one query, not one get() per id. Re-apply the
-        // active filter: a memory that flipped to expired/superseded
-        // between the two passes is silently dropped, not an error.
+        // Refetch so returned Memory values reflect the bump this call just
+        // made. A row that vanished between bump and refetch (concurrent
+        // forget()) is simply left with its pre-bump snapshot rather than
+        // dropped -- the item already survived truncation and was
+        // legitimately part of this call's result set.
         let refetched = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-            fetch_active_memories(&conn, &ordered_ids, Utc::now())?
+            fetch_memories_by_ids(&conn, &bumped_ids)?
         };
-
-        let mut results = Vec::with_capacity(ordered_ids.len());
-        for id in ordered_ids {
-            if let Some(memory) = refetched.get(&id) {
-                results.push(memory.clone());
+        for item in &mut scored {
+            if let Some(m) = refetched.get(&item.memory.id) {
+                item.memory = m.clone();
             }
-            // A memory that stopped qualifying between the bump and the
-            // refetch (e.g. it expired in the interim) is dropped silently.
         }
 
-        Ok(results)
+        Ok(RecallResult { items: scored })
     }
 
     /// Fetches a memory by its ID.
@@ -573,45 +635,33 @@ impl MemoryEngine {
     }
 }
 
-/// Batch-loads every *active* (not expired, not superseded) memory in `ids`
-/// from SQLite in one query, keyed by id.
+/// Batch-loads every memory in `ids` from SQLite in one query, keyed by id,
+/// with **no** active/expired/superseded filtering applied -- the caller
+/// decides what "eligible" means for its own use case.
 ///
-/// Used twice by `recall()`: once for the initial candidate set, once for
-/// the post-bump refetch -- both call sites need "give me exactly these
-/// ids, but only the ones still eligible" with a single round trip, not one
-/// `query_row` per id. An id present in `ids` but absent from the returned
-/// map (because no such row exists, or it no longer qualifies) is simply
-/// not a key in the map -- never an error; the caller decides what "missing"
-/// means for its own step.
-///
-/// Same expiration boundary as everywhere else in this file: `expires_at <=
-/// now` is expired.
-fn fetch_active_memories(
-    conn: &Connection,
-    ids: &[Uuid],
-    now: DateTime<Utc>,
-) -> Result<HashMap<Uuid, Memory>> {
+/// This is the general-purpose fetch `recall_query()` needs: unlike M3's
+/// `fetch_active_memories` (replaced as of M4), `RecallQuery::include_superseded`
+/// / `include_expired` mean the filter itself is a per-call decision made in
+/// Rust alongside the rest of `RecallQuery`'s filters, not a fixed SQL WHERE
+/// clause baked into the fetch. An id present in `ids` but absent from the
+/// returned map simply doesn't exist in SQLite -- never an error; the caller
+/// decides what "missing" means for its own step.
+fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid, Memory>> {
     let mut result = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
         return Ok(result);
     }
 
-    // ?1 is `now`; ?2.. are one placeholder per id.
     let id_placeholders = (0..ids.len())
-        .map(|i| format!("?{}", i + 2))
+        .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
-        "SELECT {MEMORY_COLUMNS} FROM memories \
-         WHERE id IN ({id_placeholders}) \
-           AND superseded_by IS NULL \
-           AND (expires_at IS NULL OR expires_at > ?1)"
-    );
+    let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({id_placeholders})");
 
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.timestamp())];
-    for id in ids {
-        params_vec.push(Box::new(id.to_string()));
-    }
+    let params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
+        .iter()
+        .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::ToSql>)
+        .collect();
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn.prepare(&sql)?;
@@ -786,6 +836,7 @@ fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recall::RecallQuery;
     use crate::vector_store::VectorHit;
     use async_trait::async_trait;
 
@@ -1138,13 +1189,167 @@ mod tests {
         // way that matters -- just clean up whatever SQLite created.
         let _ = std::fs::remove_file(&path);
     }
+
+    // ---- M4: recall_query() tests ----
+
+    #[tokio::test]
+    async fn recall_query_excludes_a_filtered_out_memory_type() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        engine
+            .store("the user's favorite editor is Zed", MemoryType::Semantic, 0.8)
+            .await
+            .unwrap();
+        engine
+            .store("debugged the login flow yesterday", MemoryType::Episodic, 0.8)
+            .await
+            .unwrap();
+
+        let result = engine
+            .recall_query(
+                RecallQuery::new("editor preference").memory_types(vec![MemoryType::Episodic]),
+            )
+            .await
+            .unwrap();
+
+        assert!(result
+            .items
+            .iter()
+            .all(|i| i.memory.memory_type == MemoryType::Episodic));
+    }
+
+    #[tokio::test]
+    async fn recall_query_limit_zero_is_an_error() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let result = engine
+            .recall_query(RecallQuery::new("anything").limit(0))
+            .await;
+        assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn recall_query_nan_min_importance_is_an_error() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let result = engine
+            .recall_query(RecallQuery::new("anything").min_importance(f32::NAN))
+            .await;
+        assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn recall_query_bumps_access_stats_before_returning() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        engine
+            .store("a fact worth recalling", MemoryType::Semantic, 0.8)
+            .await
+            .unwrap();
+
+        let result = engine
+            .recall_query(RecallQuery::new("a fact worth recalling"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].memory.access_count, 1,
+            "the returned Memory must already reflect this call's own bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_and_recall_query_agree_on_a_plain_query() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        engine
+            .store("plain fact one", MemoryType::Semantic, 0.7)
+            .await
+            .unwrap();
+        engine
+            .store("plain fact two", MemoryType::Semantic, 0.6)
+            .await
+            .unwrap();
+
+        let via_recall = engine.recall("plain fact").await.unwrap();
+        let via_query = engine
+            .recall_query(RecallQuery::new("plain fact"))
+            .await
+            .unwrap();
+
+        let query_ids: Vec<_> = via_query.items.iter().map(|i| i.memory.id).collect();
+        let recall_ids: Vec<_> = via_recall.iter().map(|m| m.id).collect();
+        assert_eq!(recall_ids, query_ids);
+    }
+
+    #[tokio::test]
+    async fn recall_query_metadata_equals_filters_candidates() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let id = engine
+            .store("tagged memory", MemoryType::Semantic, 0.8)
+            .await
+            .unwrap();
+
+        // metadata is empty ("{}") on every M3/M4 store() call today, so an
+        // equals-filter on a key that's never set must exclude everything.
+        let result = engine
+            .recall_query(
+                RecallQuery::new("tagged memory")
+                    .metadata_equals("project", serde_json::json!("memolite")),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.items.iter().all(|i| i.memory.id != Uuid::parse_str(&id).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn recall_query_excludes_expired_by_default_and_includes_when_asked() {
+        let path = std::env::temp_dir()
+            .join(format!("memolite-m4-expired-{}.db", Uuid::new_v4()));
+        let engine = MemoryEngine::open(&path).await.expect("engine should open");
+
+        let id = engine
+            .store("soon to expire", MemoryType::Working, 0.9)
+            .await
+            .unwrap();
+
+        // Backdate expires_at into the past via raw test-only SQL -- same
+        // trick used by the corruption test above.
+        {
+            let conn = engine.conn.lock().unwrap();
+            let past = (Utc::now() - chrono::Duration::days(1)).timestamp();
+            conn.execute(
+                "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
+                params![past, id],
+            )
+            .unwrap();
+        }
+
+        let default_result = engine
+            .recall_query(RecallQuery::new("soon to expire"))
+            .await
+            .unwrap();
+        assert!(default_result.items.is_empty());
+
+        let included_result = engine
+            .recall_query(RecallQuery::new("soon to expire").include_expired(true))
+            .await
+            .unwrap();
+        assert!(included_result
+            .items
+            .iter()
+            .any(|i| i.memory.id == Uuid::parse_str(&id).unwrap()));
+
+        drop(engine);
+        std::fs::remove_file(&path).expect("failed to remove temp db file");
+    }
 }
-
-
-
-
-
-
-
-
-
