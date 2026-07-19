@@ -1,15 +1,17 @@
 //! Sanity check that `src/lib.rs` only registers modules that are real,
-//! populated code as of M4, and does not yet declare any milestone-5+
-//! module before it has content.
+//! populated code as of the current milestone, and does not yet declare
+//! any later-milestone module before it has content.
 //!
-//! Updated from the M3 baseline: `ranking` was M4's own new module (Step
-//! 4.1), so as of M4 it moves from the "not yet" list into the "must be
-//! registered and have a real file" list, alongside everything M3 already
-//! established. Every milestone after M4 should bump this same boundary
-//! forward the same way, rather than deleting the guard.
+//! Updated from the M4 baseline: `requests` was M5's own new module
+//! (Steps 5.1-5.3 -- `StoreRequest`/`MemoryUpdate`/`ExpiryPolicy`), so as
+//! of M5 it moves from the "not yet" list into the "must be registered
+//! and have a real file" list, alongside everything M4 already
+//! established (`ranking` made the same move at the M3->M4 boundary).
+//! Every milestone after M5 should bump this same boundary forward the
+//! same way, rather than deleting the guard.
 
 #[test]
-fn lib_rs_registers_only_the_modules_that_exist_in_m4() {
+fn lib_rs_registers_only_the_modules_that_exist_in_m5() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let lib_src = std::fs::read_to_string(format!("{manifest_dir}/src/lib.rs"))
         .expect("src/lib.rs should be readable");
@@ -22,6 +24,7 @@ fn lib_rs_registers_only_the_modules_that_exist_in_m4() {
         "vector_store",
         "recall",
         "ranking",
+        "requests",
     ] {
         assert!(
             lib_src.contains(&format!("pub mod {expected};")),
@@ -50,8 +53,16 @@ fn lib_rs_registers_only_the_modules_that_exist_in_m4() {
         );
     }
 
+    // M5 introduces StoreRequest/MemoryUpdate/ExpiryPolicy and re-exports
+    // them at the crate root, same treatment as M4's recall types above.
+    for reexported in ["StoreRequest", "MemoryUpdate", "ExpiryPolicy"] {
+        assert!(
+            lib_src.contains(reexported),
+            "`{reexported}` should be re-exported from lib.rs once M5 introduces it"
+        );
+    }
+
     for not_yet in [
-        "requests",
         "confidence",
         "streaming",
         "compression",

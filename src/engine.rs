@@ -4,12 +4,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
 use crate::embedder::Embedder;
 use crate::error::{MemoliteError, Result};
 use crate::memory::{Memory, MemoryType};
+use crate::requests::{ExpiryPolicy, MemoryUpdate, StoreRequest}; // M5
 use crate::vector_store::{InMemoryVectorStore, VectorEntry, VectorStore};
 
 /// Column order shared by every `SELECT ... FROM memories` in this file and
@@ -50,19 +51,42 @@ pub enum BackfillPolicy {
 /// an in-process vector index in sync with SQLite (the durable source of
 /// truth). Ranking, decay, and consolidation are implemented elsewhere.
 ///
-/// Two conventions hold everywhere in this file, not just locally within
+/// Conventions that hold everywhere in this file, not just locally within
 /// one method -- written down here once so they can't drift apart:
 ///
 /// - **Expiration boundary:** `expires_at <= now` means "expired,"
-///   everywhere -- recall filtering, `purge_expired()` eligibility, and
-///   `reconcile_vector_index()` all use this exact boundary. Never `<` in
-///   one place and `<=` in another.
-/// - **Compensation policy:** when a SQLite write succeeds but the paired
-///   vector-store write/delete fails, the engine attempts best-effort
-///   reconciliation (via `reconcile_vector_index`) but *always* surfaces
-///   the *original* error as `Err`. A successful reconciliation never
-///   silently upgrades a real failure into `Ok` -- applies uniformly to
-///   `store()`, `forget()`, and `purge_expired()`.
+///   everywhere -- recall filtering, `purge_expired()` eligibility,
+///   `update()`'s expired-revival guard, and `reconcile_vector_index()`
+///   all use this exact boundary. Never `<` in one place and `<=` in
+///   another.
+/// - **Compensation policy:** when a SQLite write succeeds but a paired
+///   follow-up write/delete fails, the engine attempts best-effort
+///   reconciliation but *always* surfaces the *original* error as `Err`.
+///   A successful reconciliation never silently upgrades a real failure
+///   into `Ok` -- applies uniformly to `store_with_options_id()`,
+///   `forget()`, `update()`, and `purge_expired()`.
+/// - **Single write path (M5):** `store_with_options_id()` is the *only*
+///   function that ever inserts a `memories` row and its matching
+///   `embeddings` row. `store()`, `store_with_options()`, and `update()`
+///   all route through it. This is what makes "a memory row with no
+///   embedding row is corruption, never a normal state" a sound
+///   invariant for `reconcile_vector_index()` to rely on.
+/// - **Supersession is race-safe (M5):** `mark_superseded()`'s `UPDATE`
+///   only succeeds against a row that is *currently* un-superseded
+///   (`superseded_by IS NULL`). This closes two related gaps that a
+///   naive `UPDATE ... WHERE id = ?` would leave open: (1) calling
+///   `update()` twice on the same already-superseded memory would
+///   otherwise silently overwrite which memory is "the current one" a
+///   second time, corrupting the supersession chain; (2) two concurrent
+///   `update()` calls racing on the same source id would otherwise let
+///   the loser silently overwrite the winner's link with no error,
+///   leaving the loser's brand-new memory fully persisted but orphaned
+///   from the chain. `update()` also rejects an already-superseded
+///   source memory up front (before doing any embedding/storage work) so
+///   the common, non-racy case fails fast and cheaply; `mark_superseded`'s
+///   conditional `UPDATE` remains the authoritative guard against the
+///   genuinely concurrent case, since only SQLite can adjudicate that
+///   atomically.
 pub struct MemoryEngine {
     // Wrapped in a `Mutex` (rather than a bare `Connection`) so a shared
     // `&self` can be used from every method instead of `&mut self`, which
@@ -134,33 +158,68 @@ impl MemoryEngine {
         })
     }
 
-    /// Stores a new memory, generates its embedding, and persists both --
-    /// then inserts into the live vector index too (not just at
-    /// restart-reconcile time). If the vector-store insert fails, the
-    /// SQLite rows are compensated away rather than left as an orphaned
-    /// memory no `recall()` will ever find.
+    /// Stores a new memory using the crate's original simple signature.
+    /// (M5) Thin wrapper around `store_with_options` using
+    /// `ExpiryPolicy::TypeDefault` and empty metadata -- the exact
+    /// defaults `store()` always used before M5. Kept for source
+    /// compatibility; new code that wants expiry/metadata control should
+    /// call `store_with_options` directly.
     pub async fn store(
         &self,
         content: &str,
         memory_type: MemoryType,
         importance: f32,
     ) -> Result<String> {
-        if content.trim().is_empty() {
+        self.store_with_options(StoreRequest::new(content, memory_type, importance))
+            .await
+    }
+
+    /// (M5) Stores a new memory described by `request` -- with explicit
+    /// control over expiry and metadata -- generates its embedding, and
+    /// persists both, then inserts into the live vector index too.
+    /// Returns the new memory's id as a string.
+    pub async fn store_with_options(&self, request: StoreRequest) -> Result<String> {
+        self.store_with_options_id(request)
+            .await
+            .map(|id| id.to_string())
+    }
+
+    /// (M5) The single writer of a memory+embedding pair, always in one
+    /// SQLite transaction. `store()`, `store_with_options()`, and
+    /// `update()` all route through this one function -- there is exactly
+    /// one place a memory row and its embedding row are ever created
+    /// together, which is what makes `reconcile_vector_index`'s "missing
+    /// embedding = corruption" rule sound.
+    async fn store_with_options_id(&self, request: StoreRequest) -> Result<Uuid> {
+        if request.content.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
                 "content must not be empty".into(),
             ));
         }
-        if !(0.0..=1.0).contains(&importance) {
+        if !(0.0..=1.0).contains(&request.importance) {
             return Err(MemoliteError::InvalidArgument(
                 "importance must be in [0.0, 1.0]".into(),
             ));
+        }
+        if let ExpiryPolicy::Custom(d) = request.expiry {
+            if d <= chrono::Duration::zero() {
+                return Err(MemoliteError::InvalidArgument(
+                    "Custom expiry duration must be positive".into(),
+                ));
+            }
         }
 
         let id = Uuid::new_v4();
         let id_str = id.to_string();
         let created_at = Utc::now();
-        let ttl = memory_type.default_ttl();
-        let expires_at = created_at + ttl;
+        let expires_at: Option<DateTime<Utc>> = match request.expiry {
+            ExpiryPolicy::Never => None,
+            ExpiryPolicy::Custom(d) => Some(created_at + d),
+            ExpiryPolicy::TypeDefault => Some(created_at + request.memory_type.default_ttl()),
+        };
+        // (M5) Actually persist the request's metadata instead of the
+        // hardcoded "{}" the pre-M5 store() used.
+        let metadata_json = serde_json::to_string(&request.metadata)?;
 
         // Embed *before* touching SQLite: model work is slower and can
         // fail, and there's no reason to hold a DB lock across it.
@@ -169,7 +228,7 @@ impl MemoryEngine {
                 .embedder
                 .lock()
                 .map_err(|_| MemoliteError::Internal("embedder mutex poisoned".into()))?;
-            embedder.embed(content)?
+            embedder.embed(&request.content)?
         };
         let dimension = vector.len();
         let encoded_vector = bincode::serialize(&vector)
@@ -196,12 +255,12 @@ impl MemoryEngine {
                 "#,
                 params![
                     id_str,
-                    content,
-                    memory_type.as_str(),
-                    importance,
+                    request.content,
+                    request.memory_type.as_str(),
+                    request.importance,
                     created_at.timestamp(),
-                    Some(expires_at.timestamp()),
-                    "{}",
+                    expires_at.map(|e| e.timestamp()),
+                    metadata_json,
                 ],
             )?;
             tx.execute(
@@ -219,7 +278,10 @@ impl MemoryEngine {
             Arc::clone(&*guard)
         };
 
-        if let Err(e) = store.insert(id, &vector, HashMap::new()).await {
+        // (M5) Insert the request's actual metadata into the vector store
+        // too, instead of an empty HashMap, so the two copies stay
+        // consistent.
+        if let Err(e) = store.insert(id, &vector, request.metadata.clone()).await {
             // The SQLite rows are now orphaned relative to the vector
             // index -- a memory recall() can never find. Delete them
             // rather than leave that inconsistency behind.
@@ -243,7 +305,7 @@ impl MemoryEngine {
             return Err(e);
         }
 
-        Ok(id_str)
+        Ok(id)
     }
 
     /// Retrieves memories relevant to the supplied query text using the
@@ -290,9 +352,7 @@ impl MemoryEngine {
             ));
         }
         if query.limit == 0 {
-            return Err(MemoliteError::InvalidArgument(
-                "limit must be > 0".into(),
-            ));
+            return Err(MemoliteError::InvalidArgument("limit must be > 0".into()));
         }
         if !query.min_importance.is_finite() {
             return Err(MemoliteError::InvalidArgument(
@@ -560,13 +620,171 @@ impl MemoryEngine {
         Ok(())
     }
 
+    /// (M5) Applies a partial update to an existing memory. This never
+    /// mutates the existing row in place: it builds a merged `StoreRequest`
+    /// from `old` + `update`, creates a brand-new memory for it via
+    /// `store_with_options_id` (the single write path), then marks the
+    /// original row's `superseded_by` to point at the new one. Returns the
+    /// new memory's id as a string.
+    ///
+    /// Two guards keep the supersession chain from ever getting corrupted:
+    ///
+    /// - **Expired-revival guard:** reviving an expired memory requires the
+    ///   caller to explicitly supply `new_expiry` -- an update that leaves
+    ///   expiry untouched on an already-expired memory is rejected, so a
+    ///   memory can never silently come back to life through an unrelated
+    ///   field edit.
+    /// - **Already-superseded guard:** updating a memory that has already
+    ///   been superseded is rejected up front, before any embedding or
+    ///   storage work happens. Without this, a second `update()` call
+    ///   against the same original id would silently overwrite which
+    ///   memory is "the current one," breaking the one-hop chain. The
+    ///   *concurrent* version of this same problem (two `update()` calls
+    ///   racing on the same id) is closed atomically inside
+    ///   `mark_superseded()` itself, since only SQLite can adjudicate that
+    ///   race correctly -- this up-front check just makes the common,
+    ///   non-racy mistake fail fast and cheaply.
+    pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
+        let uuid = Uuid::parse_str(id)?; // MemoliteError::InvalidUuid via #[from]
+        let old = self
+            .get(id)
+            .await?
+            .ok_or_else(|| MemoliteError::NotFound(id.to_string()))?;
+
+        // Already-superseded guard (fixes the M5 review finding): reject
+        // before doing any embedding/storage work rather than silently
+        // re-pointing an already-resolved supersession link.
+        if old.superseded_by.is_some() {
+            return Err(MemoliteError::InvalidArgument(format!(
+                "memory {id} has already been superseded and cannot be updated directly; \
+                 update the memory it was superseded by instead"
+            )));
+        }
+
+        // Snapshot `now` ONCE and reuse it for both the expired check and
+        // the remaining-TTL calculation below -- using two separate
+        // `Utc::now()` calls here would let embedding latency between them
+        // flip which branch is "correct" for a memory expiring right now.
+        let now = Utc::now();
+        // Same expiration boundary as everywhere else in this file:
+        // expires_at <= now is expired.
+        let is_expired = old.expires_at.map(|e| e <= now).unwrap_or(false);
+        if is_expired && update.new_expiry.is_none() {
+            return Err(MemoliteError::InvalidArgument(
+                "memory is expired; supply new_expiry explicitly to revive it".into(),
+            ));
+        }
+
+        let mut request = StoreRequest::new(
+            &update.new_content.unwrap_or_else(|| old.content.clone()),
+            update.new_memory_type.unwrap_or(old.memory_type),
+            update.new_importance.unwrap_or(old.importance),
+        );
+        // Preserve the old memory's remaining TTL by default (or "never
+        // expire" if that's what it had); only overridden when the caller
+        // supplies new_expiry explicitly. The `None` + not-expired-but-no-
+        // override case below is reachable (e.g. no expires_at at all), so
+        // this match covers both "had no expiry" and "still has time left".
+        request.expiry = update.new_expiry.unwrap_or(match old.expires_at {
+            None => ExpiryPolicy::Never,
+            Some(old_expires_at) => ExpiryPolicy::Custom(old_expires_at.signed_duration_since(now)),
+        });
+        request.metadata = update.new_metadata.unwrap_or_else(|| old.metadata.clone());
+
+        let new_uuid = self.store_with_options_id(request).await?;
+
+        if let Err(e) = self.mark_superseded(&uuid, &new_uuid.to_string()) {
+            // The new memory was already committed to both SQLite and the
+            // vector index by store_with_options_id -- if linking it back
+            // to the old one fails, roll the new memory back rather than
+            // leave an unlinked duplicate behind. Same compensation shape
+            // as store_with_options_id's own insert-failure path.
+            let del_err = {
+                let conn = self
+                    .conn
+                    .lock()
+                    .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()));
+                conn.and_then(|c| {
+                    c.execute(
+                        "DELETE FROM memories WHERE id = ?1",
+                        params![new_uuid.to_string()],
+                    )
+                    .map_err(Into::into)
+                })
+                .err()
+            };
+            let store = {
+                let guard = self
+                    .vector_store
+                    .read()
+                    .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
+                Arc::clone(&*guard)
+            };
+            let vec_err = store.delete(new_uuid).await.err();
+
+            if del_err.is_some() || vec_err.is_some() {
+                return Err(MemoliteError::CompensationFailed {
+                    operation: e.to_string(),
+                    compensation: format!("{:?} / {:?}", del_err, vec_err),
+                });
+            }
+            return Err(e);
+        }
+
+        Ok(new_uuid.to_string())
+    }
+
+    /// (M5) Links `old_id` to `new_id` via `superseded_by`.
+    ///
+    /// The `UPDATE` is conditioned on `superseded_by IS NULL` so this is
+    /// safe against races: if two callers both pass `update()`'s up-front
+    /// "already superseded" check (because neither had committed yet) and
+    /// then race here, exactly one `UPDATE` succeeds -- the other affects
+    /// zero rows and gets a clear error back, rather than silently
+    /// overwriting the winner's link.
+    ///
+    /// `affected == 0` is disambiguated into two distinct errors so a
+    /// caller (or test) can tell them apart:
+    /// - `Err(NotFound)` if `old_id` doesn't exist at all (e.g. a
+    ///   concurrent `forget()` raced this `update()` call).
+    /// - `Err(InvalidArgument)` if `old_id` exists but was already
+    ///   superseded by the time this `UPDATE` ran (the race case above).
+    fn mark_superseded(&self, old_id: &Uuid, new_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+
+        let affected = conn.execute(
+            "UPDATE memories SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL",
+            params![new_id, old_id.to_string()],
+        )?;
+
+        if affected == 0 {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+                params![old_id.to_string()],
+                |r| r.get(0),
+            )?;
+
+            if exists {
+                return Err(MemoliteError::InvalidArgument(format!(
+                    "memory {old_id} was already superseded by another update (concurrent update race)"
+                )));
+            }
+            return Err(MemoliteError::NotFound(old_id.to_string()));
+        }
+
+        Ok(())
+    }
+
     /// Removes every expired memory from SQLite and the live vector index.
     ///
     /// Returns the number of deleted rows.
     ///
     /// Boundary convention: `expires_at <= now` counts as expired, same as
     /// every other expiration check in this file (recall filtering,
-    /// reconciliation).
+    /// reconciliation, `update()`'s revival guard).
     ///
     /// Error convention: identical to `forget()` -- if a vector-store
     /// delete fails, this makes a best-effort attempt to bring the index
@@ -677,14 +895,14 @@ fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid
 /// Reads every *active* memory row -- not superseded, not expired -- and,
 /// via a LEFT JOIN, every embedding row that should exist for it. A NULL on
 /// the embedding side means a memory row exists with no embedding -- since
-/// `store()` always writes both in one SQLite transaction, this is only
-/// reachable via external corruption of the file, and is reported as such
-/// rather than silently dropped from the index. The active-only filter
-/// narrows *which* rows are considered; it never changes that corruption
-/// detection outcome for whatever rows do match.
+/// `store_with_options_id()` always writes both in one SQLite transaction,
+/// this is only reachable via external corruption of the file, and is
+/// reported as such rather than silently dropped from the index. The
+/// active-only filter narrows *which* rows are considered; it never changes
+/// that corruption detection outcome for whatever rows do match.
 ///
 /// Expiration boundary: `expires_at <= now` is expired, same convention as
-/// `purge_expired()` and recall filtering.
+/// `purge_expired()`, recall filtering, and `update()`'s revival guard.
 ///
 /// `BackfillPolicy::ExistingOnly` returns immediately, before reading
 /// anything: "do not touch the remote store" means zero local work too,
@@ -833,12 +1051,17 @@ fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>>
         )
     })
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recall::RecallQuery;
     use crate::vector_store::VectorHit;
     use async_trait::async_trait;
+
+    // ---------------------------------------------------------------
+    // M3 tests (store/get/forget/restart/corruption/compensation)
+    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn store_persists_an_embedding_of_the_right_dimension() {
@@ -894,8 +1117,6 @@ mod tests {
             .await
             .expect("store should succeed");
 
-        // Clone the Arc, then drop the read guard, THEN await -- never hold
-        // a lock guard across an .await point.
         let store = {
             let guard = engine.vector_store.read().unwrap();
             Arc::clone(&*guard)
@@ -937,8 +1158,6 @@ mod tests {
         let result = engine.forget("not-a-uuid").await;
         assert!(matches!(result, Err(MemoliteError::InvalidUuid(_))));
 
-        // The malformed call must have zero side effects: the real memory
-        // is untouched in both SQLite and the vector index.
         assert!(engine.get(&id).await.unwrap().is_some());
         let store = {
             let guard = engine.vector_store.read().unwrap();
@@ -960,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn reopening_reconstructs_the_vector_index() {
         let path =
-            std::env::temp_dir().join(format!("memolite-step0-restart-{}.db", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("memolite-m5-restart-{}.db", Uuid::new_v4()));
 
         let id = {
             let engine = MemoryEngine::open(&path)
@@ -970,7 +1189,6 @@ mod tests {
                 .store("user prefers dark mode", MemoryType::Semantic, 0.8)
                 .await
                 .expect("store should succeed")
-            // engine (and its in-RAM vector index) dropped here
         };
 
         let engine = MemoryEngine::open(&path)
@@ -987,7 +1205,6 @@ mod tests {
             "reopening must repopulate the vector index from SQLite"
         );
 
-        // Explicitly drop engine before removing file
         drop(engine);
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
@@ -995,7 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_memory_row_with_no_embedding_fails_loudly_on_reopen() {
         let path =
-            std::env::temp_dir().join(format!("memolite-step0-corrupt-{}.db", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("memolite-m5-corrupt-{}.db", Uuid::new_v4()));
 
         let id = {
             let engine = MemoryEngine::open(&path)
@@ -1008,13 +1225,9 @@ mod tests {
         };
 
         {
-            // Simulate corruption: delete only the embeddings row, leaving
-            // an orphan memories row. Deleting a child row never trips the
-            // FK constraint (that only guards deleting/violating a parent).
             let conn = Connection::open(&path).unwrap();
             conn.execute("DELETE FROM embeddings WHERE memory_id = ?1", params![id])
                 .unwrap();
-            // Explicitly drop the raw connection before reopening
             drop(conn);
         }
 
@@ -1024,15 +1237,12 @@ mod tests {
             "a memory row with no embedding must surface as Corruption, not be silently skipped"
         );
 
-        // If open succeeded, we'd have an engine to drop, but it failed so we just
-        // need to clean up the file. The failed engine's connection was dropped
-        // when it went out of scope.
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 
     /// A `VectorStore` test double whose `insert` always fails, used to
-    /// prove `store()`'s compensation path actually deletes the orphaned
-    /// SQLite rows rather than leaving them behind.
+    /// prove `store_with_options_id()`'s compensation path actually
+    /// deletes the orphaned SQLite rows rather than leaving them behind.
     struct AlwaysFailsInsert;
 
     #[async_trait]
@@ -1058,14 +1268,14 @@ mod tests {
             Ok(())
         }
         fn dimension(&self) -> usize {
-            384 // matches Embedder::dimension()
+            384
         }
     }
 
     #[tokio::test]
     async fn store_rolls_back_orphaned_sqlite_rows_if_the_vector_store_insert_fails() {
         let path =
-            std::env::temp_dir().join(format!("memolite-step0-compensate-{}.db", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("memolite-m5-compensate-{}.db", Uuid::new_v4()));
 
         let engine = MemoryEngine::open_with_store_internal(
             &path,
@@ -1083,8 +1293,6 @@ mod tests {
             Err(MemoliteError::CompensationFailed { .. }) | Err(MemoliteError::VectorStore(_))
         ));
 
-        // Explicitly drop engine before opening a raw connection to avoid
-        // file locking issues on Windows
         drop(engine);
 
         let conn = Connection::open(&path).unwrap();
@@ -1096,16 +1304,16 @@ mod tests {
             "a failed vector-store insert must not leave an orphaned memories row"
         );
 
-        // Explicitly drop the connection before removing the file
         drop(conn);
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
- /// A `VectorStore` test double whose `delete` always fails, used to
-    /// prove `forget()`'s error-surfacing convention (Step 17/41): the
-    /// *original* vector-store error is returned even after a successful
-    /// best-effort `reconcile_vector_index` repair.
+
+    /// A `VectorStore` test double whose `delete` always fails, used to
+    /// prove `forget()`'s error-surfacing convention: the *original*
+    /// vector-store error is returned even after a successful best-effort
+    /// `reconcile_vector_index` repair.
     struct AlwaysFailsDelete;
- 
+
     #[async_trait]
     impl VectorStore for AlwaysFailsDelete {
         async fn insert(
@@ -1126,21 +1334,18 @@ mod tests {
             Ok(false)
         }
         async fn replace_all(&self, _entries: Vec<VectorEntry>) -> Result<()> {
-            // Reconciliation itself succeeds trivially here, so the test
-            // below proves forget() still surfaces the *original* delete
-            // error rather than upgrading a successful repair into `Ok`.
             Ok(())
         }
         fn dimension(&self) -> usize {
-            384 // matches Embedder::dimension()
+            384
         }
     }
- 
+
     #[tokio::test]
     async fn forget_surfaces_the_original_error_when_vector_delete_fails() {
         let path = std::env::temp_dir()
-            .join(format!("memolite-step0-forget-compensate-{}.db", Uuid::new_v4()));
- 
+            .join(format!("memolite-m5-forget-compensate-{}.db", Uuid::new_v4()));
+
         let engine = MemoryEngine::open_with_store_internal(
             &path,
             Some(Arc::new(AlwaysFailsDelete) as Arc<dyn VectorStore>),
@@ -1148,49 +1353,47 @@ mod tests {
         )
         .await
         .expect("engine should open even though its store's delete will fail later");
- 
+
         let id = engine
-            .store("will fail to delete from the vector store", MemoryType::Working, 0.5)
+            .store(
+                "will fail to delete from the vector store",
+                MemoryType::Working,
+                0.5,
+            )
             .await
             .expect("store should succeed");
- 
+
         let result = engine.forget(&id).await;
         assert!(matches!(result, Err(MemoliteError::VectorStore(_))));
- 
-        // forget() deletes from SQLite first, regardless of what happens to
-        // the vector store afterward -- the SQLite row must be gone even
-        // though the overall call returned Err.
+
         assert!(engine.get(&id).await.unwrap().is_none());
- 
+
         drop(engine);
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
- 
+
     #[tokio::test]
     async fn open_with_store_rejects_a_dimension_mismatched_backend() {
-        let path = std::env::temp_dir()
-            .join(format!("memolite-step0-dim-mismatch-{}.db", Uuid::new_v4()));
- 
-        // The real embedder produces 384-dimensional vectors; this store is
-        // deliberately the wrong size.
+        let path =
+            std::env::temp_dir().join(format!("memolite-m5-dim-mismatch-{}.db", Uuid::new_v4()));
+
         let wrong_dim_store = Arc::new(InMemoryVectorStore::new(7)) as Arc<dyn VectorStore>;
- 
+
         let result = MemoryEngine::open_with_store_internal(
             &path,
             Some(wrong_dim_store),
             BackfillPolicy::ExistingOnly,
         )
         .await;
- 
+
         assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
- 
-        // open() must reject the mismatch before doing any reconciliation
-        // work, so no database file contents should have been touched in a
-        // way that matters -- just clean up whatever SQLite created.
+
         let _ = std::fs::remove_file(&path);
     }
 
-    // ---- M4: recall_query() tests ----
+    // ---------------------------------------------------------------
+    // M4 tests (recall_query)
+    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn recall_query_excludes_a_filtered_out_memory_type() {
@@ -1198,11 +1401,19 @@ mod tests {
             .await
             .expect("engine should open");
         engine
-            .store("the user's favorite editor is Zed", MemoryType::Semantic, 0.8)
+            .store(
+                "the user's favorite editor is Zed",
+                MemoryType::Semantic,
+                0.8,
+            )
             .await
             .unwrap();
         engine
-            .store("debugged the login flow yesterday", MemoryType::Episodic, 0.8)
+            .store(
+                "debugged the login flow yesterday",
+                MemoryType::Episodic,
+                0.8,
+            )
             .await
             .unwrap();
 
@@ -1298,8 +1509,6 @@ mod tests {
             .await
             .unwrap();
 
-        // metadata is empty ("{}") on every M3/M4 store() call today, so an
-        // equals-filter on a key that's never set must exclude everything.
         let result = engine
             .recall_query(
                 RecallQuery::new("tagged memory")
@@ -1308,13 +1517,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.items.iter().all(|i| i.memory.id != Uuid::parse_str(&id).unwrap()));
+        assert!(result
+            .items
+            .iter()
+            .all(|i| i.memory.id != Uuid::parse_str(&id).unwrap()));
     }
 
     #[tokio::test]
     async fn recall_query_excludes_expired_by_default_and_includes_when_asked() {
-        let path = std::env::temp_dir()
-            .join(format!("memolite-m4-expired-{}.db", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("memolite-m5-expired-{}.db", Uuid::new_v4()));
         let engine = MemoryEngine::open(&path).await.expect("engine should open");
 
         let id = engine
@@ -1322,8 +1534,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Backdate expires_at into the past via raw test-only SQL -- same
-        // trick used by the corruption test above.
         {
             let conn = engine.conn.lock().unwrap();
             let past = (Utc::now() - chrono::Duration::days(1)).timestamp();
@@ -1351,5 +1561,322 @@ mod tests {
 
         drop(engine);
         std::fs::remove_file(&path).expect("failed to remove temp db file");
+    }
+
+    // ---------------------------------------------------------------
+    // M5 tests (store_with_options / ExpiryPolicy / update / supersede)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_with_options_persists_metadata_in_both_sqlite_and_vector_store() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let mut metadata = HashMap::new();
+        metadata.insert("project".to_string(), serde_json::json!("memolite"));
+
+        let request = StoreRequest::new("has custom metadata", MemoryType::Semantic, 0.7)
+            .metadata(metadata.clone());
+
+        let id = engine
+            .store_with_options(request)
+            .await
+            .expect("store_with_options should succeed");
+
+        let stored = engine.get(&id).await.unwrap().expect("memory should exist");
+        assert_eq!(stored.metadata, metadata);
+
+        // metadata_equals filter should now match, proving the vector-store
+        // side (which recall_query doesn't read metadata from directly, but
+        // whose insert call received it) didn't diverge from SQLite's copy.
+        let result = engine
+            .recall_query(
+                RecallQuery::new("has custom metadata")
+                    .metadata_equals("project", serde_json::json!("memolite")),
+            )
+            .await
+            .unwrap();
+        assert!(result
+            .items
+            .iter()
+            .any(|i| i.memory.id == Uuid::parse_str(&id).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn store_with_options_rejects_non_positive_custom_expiry() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let zero = StoreRequest::new("bad expiry", MemoryType::Working, 0.5)
+            .expiry(ExpiryPolicy::Custom(chrono::Duration::zero()));
+        assert!(matches!(
+            engine.store_with_options(zero).await,
+            Err(MemoliteError::InvalidArgument(_))
+        ));
+
+        let negative = StoreRequest::new("bad expiry", MemoryType::Working, 0.5)
+            .expiry(ExpiryPolicy::Custom(chrono::Duration::seconds(-10)));
+        assert!(matches!(
+            engine.store_with_options(negative).await,
+            Err(MemoliteError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn store_with_options_never_expiry_leaves_expires_at_null() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let request =
+            StoreRequest::new("never expires", MemoryType::Working, 0.5).expiry(ExpiryPolicy::Never);
+        let id = engine.store_with_options(request).await.unwrap();
+
+        let stored = engine.get(&id).await.unwrap().unwrap();
+        assert!(stored.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_content_only_preserves_other_fields() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let mut metadata = HashMap::new();
+        metadata.insert("k".to_string(), serde_json::json!("v"));
+        let request = StoreRequest::new("original content", MemoryType::Semantic, 0.6)
+            .metadata(metadata.clone());
+        let old_id = engine.store_with_options(request).await.unwrap();
+
+        let update = MemoryUpdate {
+            new_content: Some("updated content".to_string()),
+            ..Default::default()
+        };
+        let new_id = engine.update(&old_id, update).await.unwrap();
+
+        let new_memory = engine.get(&new_id).await.unwrap().unwrap();
+        assert_eq!(new_memory.content, "updated content");
+        assert_eq!(new_memory.importance, 0.6);
+        assert_eq!(new_memory.memory_type, MemoryType::Semantic);
+        assert_eq!(new_memory.metadata, metadata);
+
+        let old_memory = engine.get(&old_id).await.unwrap().unwrap();
+        assert_eq!(
+            old_memory.superseded_by,
+            Some(Uuid::parse_str(&new_id).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn update_preserves_never_expiry() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let request =
+            StoreRequest::new("never expires", MemoryType::Working, 0.5).expiry(ExpiryPolicy::Never);
+        let old_id = engine.store_with_options(request).await.unwrap();
+
+        let update = MemoryUpdate {
+            new_importance: Some(0.9),
+            ..Default::default()
+        };
+        let new_id = engine.update(&old_id, update).await.unwrap();
+
+        let new_memory = engine.get(&new_id).await.unwrap().unwrap();
+        assert!(new_memory.expires_at.is_none());
+        assert_eq!(new_memory.importance, 0.9);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_reviving_an_expired_memory_without_explicit_new_expiry() {
+        let path =
+            std::env::temp_dir().join(format!("memolite-m5-update-expired-{}.db", Uuid::new_v4()));
+        let engine = MemoryEngine::open(&path).await.expect("engine should open");
+
+        let id = engine
+            .store("will expire", MemoryType::Working, 0.5)
+            .await
+            .unwrap();
+
+        {
+            let conn = engine.conn.lock().unwrap();
+            let past = (Utc::now() - chrono::Duration::days(1)).timestamp();
+            conn.execute(
+                "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
+                params![past, id],
+            )
+            .unwrap();
+        }
+
+        let no_expiry_update = MemoryUpdate {
+            new_content: Some("still expired".to_string()),
+            ..Default::default()
+        };
+        let result = engine.update(&id, no_expiry_update).await;
+        assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
+
+        let revive_update = MemoryUpdate {
+            new_expiry: Some(ExpiryPolicy::Never),
+            ..Default::default()
+        };
+        let new_id = engine.update(&id, revive_update).await.unwrap();
+        let revived = engine.get(&new_id).await.unwrap().unwrap();
+        assert!(revived.expires_at.is_none());
+
+        drop(engine);
+        std::fs::remove_file(&path).expect("failed to remove temp db file");
+    }
+
+    #[tokio::test]
+    async fn update_on_a_nonexistent_id_is_not_found() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let result = engine
+            .update(&Uuid::new_v4().to_string(), MemoryUpdate::default())
+            .await;
+        assert!(matches!(result, Err(MemoliteError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn update_on_a_malformed_id_is_invalid_uuid() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let result = engine.update("not-a-uuid", MemoryUpdate::default()).await;
+        assert!(matches!(result, Err(MemoliteError::InvalidUuid(_))));
+    }
+
+    /// Fixes the M5 review finding: calling `update()` a second time on an
+    /// already-superseded memory must be rejected, not silently re-point
+    /// the supersession chain.
+    #[tokio::test]
+    async fn update_on_an_already_superseded_memory_is_rejected() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let original_id = engine
+            .store("v1", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+
+        let first_update = MemoryUpdate {
+            new_content: Some("v2".to_string()),
+            ..Default::default()
+        };
+        let v2_id = engine.update(&original_id, first_update).await.unwrap();
+
+        // Trying to update the now-superseded v1 again must fail, and must
+        // not touch v1's superseded_by link (still points at v2).
+        let second_update_on_v1 = MemoryUpdate {
+            new_content: Some("v1-attempted-again".to_string()),
+            ..Default::default()
+        };
+        let result = engine.update(&original_id, second_update_on_v1).await;
+        assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
+
+        let v1 = engine.get(&original_id).await.unwrap().unwrap();
+        assert_eq!(v1.superseded_by, Some(Uuid::parse_str(&v2_id).unwrap()));
+
+        // Updating v2 (the current version) must still work fine.
+        let update_v2 = MemoryUpdate {
+            new_content: Some("v3".to_string()),
+            ..Default::default()
+        };
+        let v3_id = engine.update(&v2_id, update_v2).await.unwrap();
+        let v3 = engine.get(&v3_id).await.unwrap().unwrap();
+        assert_eq!(v3.content, "v3");
+    }
+
+    /// Direct unit test of `mark_superseded`'s atomic guard: manually
+    /// racing it against an already-completed supersession must fail with
+    /// `InvalidArgument`, not silently overwrite the existing link.
+    #[tokio::test]
+    async fn mark_superseded_rejects_a_second_call_against_the_same_source_id() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let original_id = engine
+            .store("source", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        let uuid = Uuid::parse_str(&original_id).unwrap();
+
+        let winner_id = engine
+            .store("winner", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        let loser_id = engine
+            .store("loser", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+
+        engine.mark_superseded(&uuid, &winner_id).unwrap();
+
+        let result = engine.mark_superseded(&uuid, &loser_id);
+        assert!(matches!(result, Err(MemoliteError::InvalidArgument(_))));
+
+        let original = engine.get(&original_id).await.unwrap().unwrap();
+        assert_eq!(
+            original.superseded_by,
+            Some(Uuid::parse_str(&winner_id).unwrap()),
+            "the first successful mark_superseded call must remain the source of truth"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_on_a_nonexistent_id_is_not_found() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+        let winner_id = engine.store("winner", MemoryType::Semantic, 0.5).await.unwrap();
+        let missing = Uuid::new_v4();
+        let result = engine.mark_superseded(&missing, &winner_id);
+        assert!(matches!(result, Err(MemoliteError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn include_superseded_reveals_the_original_after_update() {
+        let engine = MemoryEngine::open(":memory:")
+            .await
+            .expect("engine should open");
+
+        let old_id = engine
+            .store("superseded content", MemoryType::Semantic, 0.7)
+            .await
+            .unwrap();
+        engine
+            .update(
+                &old_id,
+                MemoryUpdate {
+                    new_content: Some("superseded content v2".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let default_result = engine
+            .recall_query(RecallQuery::new("superseded content"))
+            .await
+            .unwrap();
+        assert!(default_result
+            .items
+            .iter()
+            .all(|i| i.memory.id != Uuid::parse_str(&old_id).unwrap()));
+
+        let included_result = engine
+            .recall_query(RecallQuery::new("superseded content").include_superseded(true))
+            .await
+            .unwrap();
+        assert!(included_result
+            .items
+            .iter()
+            .any(|i| i.memory.id == Uuid::parse_str(&old_id).unwrap()));
     }
 }
