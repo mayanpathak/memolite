@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+/unnecessary
 
 # Cargo.lock — ignore for libraries (this crate is `--lib`), since consumers
 # pin their own versions. If you ever ship a binary from this repo, commit
@@ -16,6 +17,7 @@ Cargo.lock
 *.db-wal
 *.sqlite
 *.sqlite3
+*.unnecessary
 
 # Editor/OS cruft
 .DS_Store
