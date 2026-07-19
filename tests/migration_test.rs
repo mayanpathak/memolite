@@ -37,13 +37,16 @@ async fn fresh_database_gets_full_schema() {
 
     assert_eq!(table_count, 3);
 
+    // As of M6, a fresh database applies two migrations: migration 1
+    // (baseline memories/embeddings schema) and migration 2 (the
+    // `confidence` column). MAX(version) is therefore 2, not 1.
     let migration_version: i64 = conn
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
 
-    assert_eq!(migration_version, 1);
+    assert_eq!(migration_version, 2);
 
     drop(conn);
     drop(engine);
@@ -79,7 +82,7 @@ async fn reopening_an_existing_database_does_not_duplicate_migrations() {
 
     let conn = Connection::open(&path).unwrap();
 
-    let migration_rows: i64 = conn
+    let migration_rows_v1: i64 = conn
         .query_row(
             "SELECT COUNT(*)
              FROM schema_migrations
@@ -89,7 +92,21 @@ async fn reopening_an_existing_database_does_not_duplicate_migrations() {
         )
         .unwrap();
 
-    assert_eq!(migration_rows, 1);
+    assert_eq!(migration_rows_v1, 1);
+
+    // Same idempotency guarantee must hold for migration 2 (confidence
+    // column, M6) across repeated opens -- not just migration 1.
+    let migration_rows_v2: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM schema_migrations
+             WHERE version = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(migration_rows_v2, 1);
 
     let memory_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))

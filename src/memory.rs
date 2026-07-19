@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::confidence::ConfidenceLevel; // M6
+
 /// The category of a memory.
 ///
 /// Different memory types have different default lifetimes and decay
@@ -104,4 +106,9 @@ pub struct Memory {
 
     /// ID of the memory that supersedes this one, if any.
     pub superseded_by: Option<Uuid>,
+
+    /// How this memory came to be trusted, and how much weight it gets in
+    /// ranking (M6). See [`ConfidenceLevel`] for the full explanation of
+    /// `Explicit` / `Inferred` / `Reinforced`.
+    pub confidence: ConfidenceLevel,
 }

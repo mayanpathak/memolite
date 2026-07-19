@@ -99,4 +99,11 @@ pub enum MemoliteError {
         operation: String,
         compensation: String,
     },
+
+    /// A row's `confidence` column (M6) contained a string outside
+    /// `('explicit','inferred','reinforced')`. Should only happen if the
+    /// schema and the `ConfidenceLevel` enum ever drift apart, or the
+    /// database was hand-edited outside the library.
+    #[error("invalid confidence value: {0}")]
+    InvalidConfidence(String),
 }
