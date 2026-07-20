@@ -1,12 +1,5 @@
-//! Scoring math for `recall_query()`: recency decay, reinforcement from
-//! repeated access, and the final weighted score. Pure functions, no I/O,
-//! so they're trivial to unit test in isolation from the engine.
-
 use crate::memory::MemoryType;
 
-/// Half-life, in days, used by [`recency_factor`]'s exponential decay.
-/// Shorter for ephemeral types (`Working`), much longer for durable ones
-/// (`Procedural`).
 pub fn decay_half_life_days(t: MemoryType) -> f64 {
     match t {
         MemoryType::Episodic => 14.0,
@@ -16,9 +9,6 @@ pub fn decay_half_life_days(t: MemoryType) -> f64 {
     }
 }
 
-/// Exponential decay factor in `(0.0, 1.0]` based on days since last
-/// access. `days_since_access` is clamped to `>= 0.0` so a clock skew or a
-/// just-recalled memory never produces a factor `> 1.0`.
 pub fn recency_factor(days_since_access: f64, memory_type: MemoryType) -> f32 {
     let days = days_since_access.max(0.0);
     let half_life = decay_half_life_days(memory_type);
@@ -26,14 +16,10 @@ pub fn recency_factor(days_since_access: f64, memory_type: MemoryType) -> f32 {
     (-decay_rate * days).exp() as f32
 }
 
-/// Mild boost for memories accessed more often. Logarithmic so repeated
-/// access has diminishing returns rather than dominating the score.
 pub fn reinforcement_factor(access_count: u32) -> f32 {
     1.0 + ((1.0 + access_count as f32).ln()) * 0.1
 }
 
-/// Combines similarity, importance, recency, reinforcement, and confidence
-/// into the single number recall results are ranked by.
 pub fn final_score(
     similarity: f32,
     importance: f32,

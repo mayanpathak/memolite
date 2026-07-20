@@ -1,43 +1,8 @@
-//! SQLite schema management.
-//!
-//! `run_migrations` is idempotent and versioned: it can be called every
-//! time `MemoryEngine::open()` runs, whether against a brand-new file or
-//! one that already has data, and it always leaves the schema in the
-//! correct, fully-indexed shape.
-//!
-//! Two migrations exist as of M6:
-//!
-//! - **Migration 1** (baseline schema): `memories` + `embeddings` tables
-//!   and their indexes.
-//! - **Migration 2** (M6, confidence): adds the `memories.confidence`
-//!   column.
-//!
-//! Both are applied, in order, every time `run_migrations` runs, and both
-//! are individually idempotent -- calling this function against a database
-//! that already has migration 1 and/or migration 2 applied is always safe
-//! and a no-op for whichever parts are already in place.
-//!
-//! Sequencing note (M6): confidence support is intentionally *not*
-//! referenced from Step 0/migration 1. Everything M6 needs --
-//! `src/confidence.rs`, the `confidence` column, and this file's migration
-//! 2 -- is introduced together in this same change, so there is never a
-//! point where `run_migrations` calls into a module that doesn't exist yet.
-//!
-//! This is also where a real, previously-silent bug is fixed: the original
-//! schema declared `embeddings.memory_id ... ON DELETE CASCADE`, but
-//! nothing ever executed `PRAGMA foreign_keys = ON`. SQLite disables
-//! foreign-key enforcement by default, so that cascade delete was never
-//! actually happening -- deleting a memory left an orphaned embedding row
-//! behind. `run_migrations` turns the pragma on for every connection that
-//! opens through `MemoryEngine::open()`.
-
 use rusqlite::Connection;
 
 use crate::error::{MemoliteError, Result};
 
 pub fn run_migrations(conn: &mut Connection) -> Result<()> {
-    // PRAGMAs are per-connection, not persisted in the database file --
-    // this must run on every open, not just the first one.
     conn.execute("PRAGMA foreign_keys = ON", [])?;
 
     conn.execute(
@@ -48,7 +13,6 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         [],
     )?;
 
-    // ---- migration 1: baseline memories/embeddings + indexes ----
     let tx = conn.transaction()?;
 
     let already_applied: bool = {
@@ -98,17 +62,8 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
 
     tx.commit()?;
 
-    // ---- migration 2 (M6): confidence column ----
     run_confidence_migration(conn)?;
 
-    // Orphan/FK-drift detection (Phase 1, Step 5). `embeddings.memory_id`
-    // has always declared `ON DELETE CASCADE`, but before this file existed
-    // nothing ever turned `PRAGMA foreign_keys = ON`, so old databases can
-    // still be carrying orphaned `embeddings` rows from before enforcement
-    // was ever active. This check runs on every `open()`, not just once,
-    // and fails loudly instead of letting a corrupted file silently limp
-    // along. It runs *after* both migrations so it always validates the
-    // final schema state, not an intermediate one.
     let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
     let violations: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -125,21 +80,6 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Migration 2 (M6): adds the `confidence` column to `memories` if it
-/// doesn't already exist, and records schema version 2 in
-/// `schema_migrations`.
-///
-/// Idempotent and transactional, following the same discipline as
-/// migration 1: existence is checked via `PRAGMA table_info(memories)`
-/// *before* running `ALTER TABLE`, so calling this on every
-/// `MemoryEngine::open()` never fails with SQLite's "duplicate column
-/// name" error on a database that already has the column.
-///
-/// The new column gets a `NOT NULL DEFAULT 'explicit'` plus the same
-/// `CHECK` constraint the baseline schema uses for other enum-like
-/// columns, so every pre-M6 row already in the database is treated as
-/// `Explicit` confidence -- the same assumption `store()` always made
-/// before M6 introduced the concept.
 fn run_confidence_migration(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
 
@@ -226,8 +166,6 @@ mod tests {
     fn a_database_with_only_migration_1_gets_the_confidence_column_added() {
         let mut conn = Connection::open_in_memory().unwrap();
 
-        // Simulate a pre-M6 database: run only the baseline table creation
-        // and record version 1, without ever calling run_confidence_migration.
         conn.execute(
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
             [],

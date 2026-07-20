@@ -1,34 +1,17 @@
-
-
-
-
-
-
-
-
 use std::collections::HashMap;
 
 use serde_json::Value;
 
 use crate::memory::{Memory, MemoryType};
 
-/// Hard ceiling on how many nearest-neighbor hits `recall_query()` ever
-/// pulls from a `VectorStore` in one call.
 pub const MAX_CANDIDATES: usize = 500;
 
-/// Default number of results a recall call returns once eligibility
-/// filtering and truncation have been applied.
 pub const DEFAULT_RECALL_LIMIT: usize = 10;
 
-/// Calculates the candidate pool requested from the vector store before
-/// later filtering narrows the result set.
 pub fn candidate_pool_size(limit: usize) -> usize {
     limit.saturating_mul(5).clamp(50, MAX_CANDIDATES)
 }
 
-/// A structured recall request. `RecallQuery::new(text)` gives sane
-/// defaults (limit `DEFAULT_RECALL_LIMIT`, no filters, superseded/expired
-/// excluded); every other field is opt-in via the builder methods.
 #[derive(Debug, Clone)]
 pub struct RecallQuery {
     pub query_text: String,
@@ -84,8 +67,6 @@ impl RecallQuery {
     }
 }
 
-/// One ranked recall result: the memory itself, its raw vector-space
-/// similarity, and the final blended score it was ranked by.
 #[derive(Debug, Clone)]
 pub struct RecallItem {
     pub memory: Memory,
@@ -93,8 +74,6 @@ pub struct RecallItem {
     pub score: f32,
 }
 
-/// The full output of a `recall_query()` call, already sorted by score
-/// (descending) and truncated to the requested limit.
 #[derive(Debug, Clone)]
 pub struct RecallResult {
     pub items: Vec<RecallItem>,
