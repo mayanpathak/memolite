@@ -12,10 +12,6 @@ type MetadataMap = HashMap<String, Value>;
 type StoredVector = (Vec<f32>, MetadataMap);
 type VectorMap = HashMap<Uuid, StoredVector>;
 
-/// Default in-memory vector store.
-///
-/// Vectors are stored in a hash map protected by an `RwLock`. Searches use
-/// a brute-force linear scan, so search complexity is O(n).
 pub struct InMemoryVectorStore {
     dim: usize,
     data: RwLock<VectorMap>,
@@ -29,22 +25,6 @@ impl InMemoryVectorStore {
         }
     }
 
-    /// Cosine similarity between two vectors.
-    ///
-    /// Hardened per the crate's validation contract (Step 0.3's
-    /// `validate_vector` covers *inputs to the trait*, but this function
-    /// does not assume that already ran -- it re-checks finiteness itself,
-    /// so it is safe to call from anywhere, not just from behind a
-    /// `validate_vector` call):
-    /// - Dot product and both norms are accumulated in `f64`, only cast to
-    ///   `f32` at the very end, so a large-but-finite pair of vectors can't
-    ///   silently overflow `f32` mid-calculation.
-    /// - A zero norm on either side returns `Ok(0.0)` -- a legitimate "no
-    ///   direction" case, not an error.
-    /// - A non-finite component in either input, or a non-finite *result*
-    ///   (the large-finite-value overflow case), returns
-    ///   `Err(VectorStore(...))` rather than silently handing back `0.0`,
-    ///   which would otherwise let a bad score masquerade as "unrelated."
     fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
         for &v in a.iter().chain(b.iter()) {
             if !v.is_finite() {
@@ -276,8 +256,6 @@ mod tests {
 
     #[tokio::test]
     async fn large_finite_vectors_do_not_overflow_cosine() {
-        // f32::MAX squared overflows f32 accumulation but not f64 -- this
-        // proves cosine() accumulates in f64 rather than f32.
         let store = InMemoryVectorStore::new(2);
         let id = Uuid::new_v4();
         let big = f32::MAX / 2.0;
@@ -297,11 +275,6 @@ mod tests {
 
     #[tokio::test]
     async fn lock_poisoning_surfaces_as_vectorstore_error_not_internal() {
-        // Poison the RwLock by panicking while holding the write guard,
-        // then confirm the resulting error is `VectorStore`, not
-        // `Internal` -- `Internal` is reserved for the engine's own
-        // (`conn`/`embedder`) locks; `VectorStore` means "the backend
-        // broke," and this backend's poisoned lock must say so.
         let store = std::sync::Arc::new(InMemoryVectorStore::new(2));
         let store_clone = std::sync::Arc::clone(&store);
 

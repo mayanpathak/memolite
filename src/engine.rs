@@ -7,133 +7,36 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
-use crate::confidence::ConfidenceLevel; // M6
+use crate::confidence::ConfidenceLevel;
 use crate::embedder::Embedder;
 use crate::error::{MemoliteError, Result};
 use crate::memory::{Memory, MemoryType};
-use crate::requests::{ExpiryPolicy, MemoryUpdate, StoreRequest}; // M5
+use crate::requests::{ExpiryPolicy, MemoryUpdate, StoreRequest};
 use crate::vector_store::{InMemoryVectorStore, VectorEntry, VectorStore};
 
-/// Column order shared by every `SELECT ... FROM memories` in this file and
-/// consumed by `row_to_memory`. Centralized so a future column addition is
-/// a one-line edit, not a hunt through every query string.
-///
-/// M6 extends this from 10 to 11 columns by appending `confidence`.
-/// `row_to_memory` reads columns strictly in this order, so the two must
-/// never drift apart.
 const MEMORY_COLUMNS: &str = "id, content, type, importance, access_count, \
     created_at, last_accessed, expires_at, superseded_by, metadata, confidence";
 
-/// Controls what `open_with_store_internal` does to a caller-supplied
-/// backend's *existing* remote contents at open time. `open()` itself
-/// always uses `ReplaceAll`, which is safe there specifically because the
-/// in-memory store it constructs is private to that one engine instance --
-/// nothing else could ever be sharing it. A future public
-/// `open_with_store()` (M11) will require the caller to choose explicitly,
-/// since a remote backend may not be exclusively owned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillPolicy {
-    /// Do not touch the remote store's contents, and do not even read
-    /// local rows to validate them. The cheapest possible open. Safe
-    /// default for a backend shared with other data; local rows with no
-    /// matching remote vector simply won't be found by recall until an
-    /// explicit rebuild is requested later.
     ExistingOnly,
-    /// Upsert every local row into the store via `insert`, but never
-    /// delete anything the store already has that SQLite doesn't know
-    /// about. Safe for a shared backend.
     UpsertLocal,
-    /// Make the store's contents exactly this database's rows via
-    /// `replace_all`. Only correct when the backend/collection is
-    /// dedicated to this one database.
     ReplaceAll,
 }
 
-/// SQLite-backed memory engine.
-///
-/// This is responsible for persistence, embedding generation, and keeping
-/// an in-process vector index in sync with SQLite (the durable source of
-/// truth). Ranking, decay, and consolidation are implemented elsewhere.
-///
-/// Conventions that hold everywhere in this file, not just locally within
-/// one method -- written down here once so they can't drift apart:
-///
-/// - **Expiration boundary:** `expires_at <= now` means "expired,"
-///   everywhere -- recall filtering, `purge_expired()` eligibility,
-///   `update()`'s expired-revival guard, and `reconcile_vector_index()`
-///   all use this exact boundary. Never `<` in one place and `<=` in
-///   another.
-/// - **Compensation policy:** when a SQLite write succeeds but a paired
-///   follow-up write/delete fails, the engine attempts best-effort
-///   reconciliation but *always* surfaces the *original* error as `Err`.
-///   A successful reconciliation never silently upgrades a real failure
-///   into `Ok` -- applies uniformly to `store_with_options_id()`,
-///   `forget()`, `update()`, and `purge_expired()`.
-/// - **Single write path (M5):** `store_with_options_id()` is the *only*
-///   function that ever inserts a `memories` row and its matching
-///   `embeddings` row. `store()`, `store_with_options()`, and `update()`
-///   all route through it. This is what makes "a memory row with no
-///   embedding row is corruption, never a normal state" a sound
-///   invariant for `reconcile_vector_index()` to rely on.
-/// - **Supersession is race-safe (M5):** `mark_superseded()`'s `UPDATE`
-///   only succeeds against a row that is *currently* un-superseded
-///   (`superseded_by IS NULL`). This closes two related gaps that a
-///   naive `UPDATE ... WHERE id = ?` would leave open: (1) calling
-///   `update()` twice on the same already-superseded memory would
-///   otherwise silently overwrite which memory is "the current one" a
-///   second time, corrupting the supersession chain; (2) two concurrent
-///   `update()` calls racing on the same source id would otherwise let
-///   the loser silently overwrite the winner's link with no error,
-///   leaving the loser's brand-new memory fully persisted but orphaned
-///   from the chain. `update()` also rejects an already-superseded
-///   source memory up front (before doing any embedding/storage work) so
-///   the common, non-racy case fails fast and cheaply; `mark_superseded`'s
-///   conditional `UPDATE` remains the authoritative guard against the
-///   genuinely concurrent case, since only SQLite can adjudicate that
-///   atomically.
-/// - **Confidence reinterpretation (M6):** `update()` treats
-///   `MemoryUpdate::new_confidence: None` as "this is an inferred
-///   reinterpretation of the old memory," not "keep the old confidence."
-///   A caller that wants to preserve `Explicit`/`Reinforced` confidence
-///   across an update must pass `new_confidence` explicitly. Only
-///   `Inferred` memories are ever eligible for promotion, and only
-///   `recall_query()`'s access-stats bump promotes them, once
-///   `access_count` reaches `ConfidenceLevel::PROMOTION_THRESHOLD`.
 pub struct MemoryEngine {
-    // Wrapped in a `Mutex` (rather than a bare `Connection`) so a shared
-    // `&self` can be used from every method instead of `&mut self`, which
-    // matters once the engine is held behind an `Arc` and called from
-    // multiple concurrent tasks. Every method acquires this lock, does its
-    // SQLite work, and drops the guard *before* awaiting anything else --
-    // holding a std Mutex across an `.await` risks deadlocking another
-    // task on the same thread.
     conn: Mutex<Connection>,
     embedder: Mutex<Embedder>,
     vector_store: RwLock<Arc<dyn VectorStore>>,
-    // Reserved for the maintenance controller (a later milestone). Declared
-    // now, alongside every other field, so this struct's shape never has
-    // to change again after Step 0 -- no milestone after this one edits
-    // MemoryEngine's field list.
     #[allow(dead_code)]
     maintenance_running: Arc<AtomicBool>,
 }
 
 impl MemoryEngine {
-    /// Opens (or creates) the SQLite database, backed by the default
-    /// in-memory vector store, and loads the local embedding model.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_store_internal(path, None, BackfillPolicy::ReplaceAll).await
     }
 
-    /// Shared constructor.
-    ///
-    /// - `store_override: None` constructs a fresh `InMemoryVectorStore`
-    ///   sized to the embedder's dimension (what `open()` does).
-    /// - `store_override: Some(s)` uses a caller-supplied backend `s`
-    ///   instead. Not exercised by any public API yet -- reserved for a
-    ///   future public `open_with_store()`. `pub(crate)` rather than
-    ///   private so that future constructor lives in a different module
-    ///   without needing engine.rs to change.
     pub(crate) async fn open_with_store_internal(
         path: impl AsRef<Path>,
         store_override: Option<Arc<dyn VectorStore>>,
@@ -170,12 +73,6 @@ impl MemoryEngine {
         })
     }
 
-    /// Stores a new memory using the crate's original simple signature.
-    /// (M5) Thin wrapper around `store_with_options` using
-    /// `ExpiryPolicy::TypeDefault` and empty metadata -- the exact
-    /// defaults `store()` always used before M5. Kept for source
-    /// compatibility; new code that wants expiry/metadata/confidence
-    /// control should call `store_with_options` directly.
     pub async fn store(
         &self,
         content: &str,
@@ -186,22 +83,12 @@ impl MemoryEngine {
             .await
     }
 
-    /// (M5) Stores a new memory described by `request` -- with explicit
-    /// control over expiry, metadata, and (M6) confidence -- generates its
-    /// embedding, and persists both, then inserts into the live vector
-    /// index too. Returns the new memory's id as a string.
     pub async fn store_with_options(&self, request: StoreRequest) -> Result<String> {
         self.store_with_options_id(request)
             .await
             .map(|id| id.to_string())
     }
 
-    /// (M5) The single writer of a memory+embedding pair, always in one
-    /// SQLite transaction. `store()`, `store_with_options()`, and
-    /// `update()` all route through this one function -- there is exactly
-    /// one place a memory row and its embedding row are ever created
-    /// together, which is what makes `reconcile_vector_index`'s "missing
-    /// embedding = corruption" rule sound.
     async fn store_with_options_id(&self, request: StoreRequest) -> Result<Uuid> {
         if request.content.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
@@ -229,12 +116,8 @@ impl MemoryEngine {
             ExpiryPolicy::Custom(d) => Some(created_at + d),
             ExpiryPolicy::TypeDefault => Some(created_at + request.memory_type.default_ttl()),
         };
-        // (M5) Actually persist the request's metadata instead of the
-        // hardcoded "{}" the pre-M5 store() used.
         let metadata_json = serde_json::to_string(&request.metadata)?;
 
-        // Embed *before* touching SQLite: model work is slower and can
-        // fail, and there's no reason to hold a DB lock across it.
         let vector = {
             let mut embedder = self
                 .embedder
@@ -252,10 +135,6 @@ impl MemoryEngine {
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
 
-            // Both rows are written in ONE transaction. reconcile_vector_index
-            // (and every future reader that joins memories<->embeddings)
-            // depends on "a memories row always has a matching embeddings
-            // row" being a real invariant, not just usually true.
             let tx = conn.transaction()?;
             tx.execute(
                 r#"
@@ -273,7 +152,7 @@ impl MemoryEngine {
                     created_at.timestamp(),
                     expires_at.map(|e| e.timestamp()),
                     metadata_json,
-                    request.confidence.as_str(), // M6
+                    request.confidence.as_str(),
                 ],
             )?;
             tx.execute(
@@ -281,7 +160,7 @@ impl MemoryEngine {
                 params![id_str, encoded_vector, dimension as i64],
             )?;
             tx.commit()?;
-        } // conn guard dropped here, before the vector-store .await below
+        }
 
         let store = {
             let guard = self
@@ -291,13 +170,7 @@ impl MemoryEngine {
             Arc::clone(&*guard)
         };
 
-        // (M5) Insert the request's actual metadata into the vector store
-        // too, instead of an empty HashMap, so the two copies stay
-        // consistent.
         if let Err(e) = store.insert(id, &vector, request.metadata.clone()).await {
-            // The SQLite rows are now orphaned relative to the vector
-            // index -- a memory recall() can never find. Delete them
-            // rather than leave that inconsistency behind.
             let compensation = {
                 let conn = self
                     .conn
@@ -321,13 +194,6 @@ impl MemoryEngine {
         Ok(id)
     }
 
-    /// Retrieves memories relevant to the supplied query text using the
-    /// default `RecallQuery` (limit `DEFAULT_RECALL_LIMIT`, no filters,
-    /// superseded/expired excluded).
-    ///
-    /// As of M4 this is a thin wrapper around [`Self::recall_query`] --
-    /// there is exactly one bump-and-refetch code path in the crate,
-    /// defined once in `recall_query()`, not two that can drift apart.
     pub async fn recall(&self, query: &str) -> Result<Vec<Memory>> {
         let result = self
             .recall_query(crate::recall::RecallQuery::new(query))
@@ -335,22 +201,6 @@ impl MemoryEngine {
         Ok(result.items.into_iter().map(|i| i.memory).collect())
     }
 
-    /// The full recall implementation: embed the query, search the live
-    /// vector index for nearest neighbors, batch-load and filter the
-    /// matching SQLite rows, score and rank them, truncate to
-    /// `query.limit`, then bump access stats for exactly that truncated set
-    /// and batch-refetch so the returned `Memory` values reflect the bump
-    /// this very call made -- never pre-increment values.
-    ///
-    /// A candidate the vector index still has but that SQLite no longer has
-    /// (e.g. a partially-failed concurrent `forget()`) is silently dropped
-    /// from the result, never an error -- same convention as M3's
-    /// `recall()`.
-    ///
-    /// `confidence_weight` (M6) is `memory.confidence.weight()` --
-    /// `Explicit`/`Reinforced` score at full weight, `Inferred` at a
-    /// discount, until it earns promotion (see the access-stats bump
-    /// below).
     pub async fn recall_query(
         &self,
         query: crate::recall::RecallQuery,
@@ -371,9 +221,6 @@ impl MemoryEngine {
             ));
         }
 
-        // Embed the query. Lock the embedder only for the synchronous
-        // embed() call and drop the guard before anything else -- same
-        // discipline as store()'s use of the embedder.
         let query_vector = {
             let mut embedder = self
                 .embedder
@@ -382,7 +229,6 @@ impl MemoryEngine {
             embedder.embed(&query.query_text)?
         };
 
-        // Clone the vector-store handle, drop the read guard, THEN await.
         let store = {
             let guard = self
                 .vector_store
@@ -401,24 +247,16 @@ impl MemoryEngine {
         let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
         let now = Utc::now();
 
-        // One unfiltered batch query for every candidate; RecallQuery's
-        // filters (type, importance, metadata, superseded/expired
-        // inclusion) are all applied in Rust below, uniformly, rather than
-        // being split across a fixed SQL WHERE clause and ad-hoc Rust
-        // checks.
         let by_id = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             fetch_memories_by_ids(&conn, &hit_ids)?
-        }; // conn guard dropped here, before anything below
+        };
 
         let mut scored: Vec<RecallItem> = Vec::with_capacity(hits.len());
         for hit in &hits {
-            // A candidate the vector index has but SQLite no longer has
-            // (e.g. a partially-failed concurrent forget()) is silently
-            // dropped, never an error.
             let Some(memory) = by_id.get(&hit.id) else {
                 continue;
             };
@@ -434,8 +272,6 @@ impl MemoryEngine {
             if memory.superseded_by.is_some() && !query.include_superseded {
                 continue;
             }
-            // Same expiration boundary as everywhere else in this file:
-            // expires_at <= now is expired.
             if memory.expires_at.map(|e| e <= now).unwrap_or(false) && !query.include_expired {
                 continue;
             }
@@ -450,7 +286,7 @@ impl MemoryEngine {
             let days_since_access = (now - memory.last_accessed).num_seconds() as f64 / 86400.0;
             let recency = crate::ranking::recency_factor(days_since_access, memory.memory_type);
             let reinforcement = crate::ranking::reinforcement_factor(memory.access_count);
-            let confidence_weight = memory.confidence.weight(); // M6: was a 1.0_f32 stub through M5
+            let confidence_weight = memory.confidence.weight();
             let score = crate::ranking::final_score(
                 hit.score,
                 memory.importance,
@@ -477,13 +313,6 @@ impl MemoryEngine {
             return Ok(RecallResult { items: Vec::new() });
         }
 
-        // Bump access stats for exactly the truncated set, in one
-        // transaction -- same batching pattern M3's recall() used, not a
-        // per-item loop. As of M6, this same UPDATE also promotes any
-        // Inferred memory whose access_count is about to reach
-        // ConfidenceLevel::PROMOTION_THRESHOLD to Reinforced -- one SQL
-        // statement, so the count and the promotion decision can never
-        // observe different access_count values.
         let bumped_ids: Vec<Uuid> = scored.iter().map(|i| i.memory.id).collect();
         {
             let mut conn = self
@@ -516,14 +345,8 @@ impl MemoryEngine {
                 params_vec.iter().map(|p| p.as_ref()).collect();
             tx.execute(&sql, params_refs.as_slice())?;
             tx.commit()?;
-        } // conn guard dropped here, before the refetch below
+        }
 
-        // Refetch so returned Memory values reflect the bump (and any
-        // confidence promotion) this call just made. A row that vanished
-        // between bump and refetch (concurrent forget()) is simply left
-        // with its pre-bump snapshot rather than dropped -- the item
-        // already survived truncation and was legitimately part of this
-        // call's result set.
         let refetched = {
             let conn = self
                 .conn
@@ -540,13 +363,8 @@ impl MemoryEngine {
         Ok(RecallResult { items: scored })
     }
 
-    /// Fetches a memory by its ID.
-    ///
-    /// The id is parsed as a UUID *before* touching SQLite -- a malformed
-    /// id is rejected with zero database work, same discipline as
-    /// `forget()`.
     pub async fn get(&self, id: &str) -> Result<Option<Memory>> {
-        let uuid = Uuid::parse_str(id)?; // MemoliteError::InvalidUuid via #[from]
+        let uuid = Uuid::parse_str(id)?;
 
         let conn = self
             .conn
@@ -561,8 +379,6 @@ impl MemoryEngine {
         Ok(memory)
     }
 
-    /// Fetches the raw embedding vector stored for a given memory id, if
-    /// any.
     pub async fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>> {
         let conn = self
             .conn
@@ -595,7 +411,6 @@ impl MemoryEngine {
         Ok(Some(vector))
     }
 
-    /// Returns the dimension of vectors produced by this engine's embedder.
     pub fn dimension(&self) -> usize {
         self.embedder
             .lock()
@@ -603,11 +418,8 @@ impl MemoryEngine {
             .dimension()
     }
 
-    /// Permanently deletes a memory (hard delete). Deleting a nonexistent
-    /// but well-formed ID is not an error. A syntactically invalid ID is
-    /// rejected *before* any mutation happens, not after.
     pub async fn forget(&self, id: &str) -> Result<()> {
-        let uuid = Uuid::parse_str(id)?; // MemoliteError::InvalidUuid via #[from]; zero side effects on failure
+        let uuid = Uuid::parse_str(id)?;
 
         {
             let conn = self
@@ -626,8 +438,6 @@ impl MemoryEngine {
         };
 
         if let Err(e) = store.delete(uuid).await {
-            // The SQLite row is already gone. Bring the vector index back
-            // in sync with SQLite rather than leaving a stale entry.
             if let Err(reconcile_err) =
                 reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
             {
@@ -642,46 +452,13 @@ impl MemoryEngine {
         Ok(())
     }
 
-    /// (M5) Applies a partial update to an existing memory. This never
-    /// mutates the existing row in place: it builds a merged `StoreRequest`
-    /// from `old` + `update`, creates a brand-new memory for it via
-    /// `store_with_options_id` (the single write path), then marks the
-    /// original row's `superseded_by` to point at the new one. Returns the
-    /// new memory's id as a string.
-    ///
-    /// Three guards keep the supersession chain -- and confidence -- from
-    /// ever getting corrupted or silently overstated:
-    ///
-    /// - **Expired-revival guard:** reviving an expired memory requires the
-    ///   caller to explicitly supply `new_expiry` -- an update that leaves
-    ///   expiry untouched on an already-expired memory is rejected, so a
-    ///   memory can never silently come back to life through an unrelated
-    ///   field edit.
-    /// - **Already-superseded guard:** updating a memory that has already
-    ///   been superseded is rejected up front, before any embedding or
-    ///   storage work happens. Without this, a second `update()` call
-    ///   against the same original id would silently overwrite which
-    ///   memory is "the current one," breaking the one-hop chain. The
-    ///   *concurrent* version of this same problem (two `update()` calls
-    ///   racing on the same id) is closed atomically inside
-    ///   `mark_superseded()` itself, since only SQLite can adjudicate that
-    ///   race correctly -- this up-front check just makes the common,
-    ///   non-racy mistake fail fast and cheaply.
-    /// - **Confidence reinterpretation (M6):** unless the caller supplies
-    ///   `update.new_confidence` explicitly, the new memory is stored as
-    ///   `ConfidenceLevel::Inferred` -- an update is a reinterpretation of
-    ///   the old memory, not a restatement of it, so it does not inherit
-    ///   the old memory's `Explicit`/`Reinforced` trust level for free.
     pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
-        let uuid = Uuid::parse_str(id)?; // MemoliteError::InvalidUuid via #[from]
+        let uuid = Uuid::parse_str(id)?;
         let old = self
             .get(id)
             .await?
             .ok_or_else(|| MemoliteError::NotFound(id.to_string()))?;
 
-        // Already-superseded guard (fixes the M5 review finding): reject
-        // before doing any embedding/storage work rather than silently
-        // re-pointing an already-resolved supersession link.
         if old.superseded_by.is_some() {
             return Err(MemoliteError::InvalidArgument(format!(
                 "memory {id} has already been superseded and cannot be updated directly; \
@@ -689,13 +466,7 @@ impl MemoryEngine {
             )));
         }
 
-        // Snapshot `now` ONCE and reuse it for both the expired check and
-        // the remaining-TTL calculation below -- using two separate
-        // `Utc::now()` calls here would let embedding latency between them
-        // flip which branch is "correct" for a memory expiring right now.
         let now = Utc::now();
-        // Same expiration boundary as everywhere else in this file:
-        // expires_at <= now is expired.
         let is_expired = old.expires_at.map(|e| e <= now).unwrap_or(false);
         if is_expired && update.new_expiry.is_none() {
             return Err(MemoliteError::InvalidArgument(
@@ -708,29 +479,16 @@ impl MemoryEngine {
             update.new_memory_type.unwrap_or(old.memory_type),
             update.new_importance.unwrap_or(old.importance),
         );
-        // Preserve the old memory's remaining TTL by default (or "never
-        // expire" if that's what it had); only overridden when the caller
-        // supplies new_expiry explicitly. The `None` + not-expired-but-no-
-        // override case below is reachable (e.g. no expires_at at all), so
-        // this match covers both "had no expiry" and "still has time left".
         request.expiry = update.new_expiry.unwrap_or(match old.expires_at {
             None => ExpiryPolicy::Never,
             Some(old_expires_at) => ExpiryPolicy::Custom(old_expires_at.signed_duration_since(now)),
         });
         request.metadata = update.new_metadata.unwrap_or_else(|| old.metadata.clone());
-        // (M6) An update without an explicit confidence level is treated as
-        // an inferred reinterpretation of the old memory -- see the
-        // MemoryUpdate::new_confidence doc comment for the full rationale.
         request.confidence = update.new_confidence.unwrap_or(ConfidenceLevel::Inferred);
 
         let new_uuid = self.store_with_options_id(request).await?;
 
         if let Err(e) = self.mark_superseded(&uuid, &new_uuid.to_string()) {
-            // The new memory was already committed to both SQLite and the
-            // vector index by store_with_options_id -- if linking it back
-            // to the old one fails, roll the new memory back rather than
-            // leave an unlinked duplicate behind. Same compensation shape
-            // as store_with_options_id's own insert-failure path.
             let del_err = {
                 let conn = self
                     .conn
@@ -766,21 +524,6 @@ impl MemoryEngine {
         Ok(new_uuid.to_string())
     }
 
-    /// (M5) Links `old_id` to `new_id` via `superseded_by`.
-    ///
-    /// The `UPDATE` is conditioned on `superseded_by IS NULL` so this is
-    /// safe against races: if two callers both pass `update()`'s up-front
-    /// "already superseded" check (because neither had committed yet) and
-    /// then race here, exactly one `UPDATE` succeeds -- the other affects
-    /// zero rows and gets a clear error back, rather than silently
-    /// overwriting the winner's link.
-    ///
-    /// `affected == 0` is disambiguated into two distinct errors so a
-    /// caller (or test) can tell them apart:
-    /// - `Err(NotFound)` if `old_id` doesn't exist at all (e.g. a
-    ///   concurrent `forget()` raced this `update()` call).
-    /// - `Err(InvalidArgument)` if `old_id` exists but was already
-    ///   superseded by the time this `UPDATE` ran (the race case above).
     fn mark_superseded(&self, old_id: &Uuid, new_id: &str) -> Result<()> {
         let conn = self
             .conn
@@ -810,19 +553,6 @@ impl MemoryEngine {
         Ok(())
     }
 
-    /// Removes every expired memory from SQLite and the live vector index.
-    ///
-    /// Returns the number of deleted rows.
-    ///
-    /// Boundary convention: `expires_at <= now` counts as expired, same as
-    /// every other expiration check in this file (recall filtering,
-    /// reconciliation, `update()`'s revival guard).
-    ///
-    /// Error convention: identical to `forget()` -- if a vector-store
-    /// delete fails, this makes a best-effort attempt to bring the index
-    /// back in sync via `reconcile_vector_index`, but the *original*
-    /// vector-store error is always what gets returned (never silently
-    /// upgraded to `Ok` just because reconciliation happened to succeed).
     pub async fn purge_expired(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
 
@@ -874,10 +604,6 @@ impl MemoryEngine {
                     compensation: reconcile_error.to_string(),
                 });
             }
-            // Reconciliation repaired the index, but per the compensation
-            // convention the original failure is still surfaced -- a
-            // successful best-effort repair never turns a real error into
-            // `Ok`.
             return Err(MemoliteError::VectorStore(combined));
         }
 
@@ -885,17 +611,6 @@ impl MemoryEngine {
     }
 }
 
-/// Batch-loads every memory in `ids` from SQLite in one query, keyed by id,
-/// with **no** active/expired/superseded filtering applied -- the caller
-/// decides what "eligible" means for its own use case.
-///
-/// This is the general-purpose fetch `recall_query()` needs: unlike M3's
-/// `fetch_active_memories` (replaced as of M4), `RecallQuery::include_superseded`
-/// / `include_expired` mean the filter itself is a per-call decision made in
-/// Rust alongside the rest of `RecallQuery`'s filters, not a fixed SQL WHERE
-/// clause baked into the fetch. An id present in `ids` but absent from the
-/// returned map simply doesn't exist in SQLite -- never an error; the caller
-/// decides what "missing" means for its own step.
 fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid, Memory>> {
     let mut result = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
@@ -924,25 +639,6 @@ fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid
     Ok(result)
 }
 
-/// Reads every *active* memory row -- not superseded, not expired -- and,
-/// via a LEFT JOIN, every embedding row that should exist for it. A NULL on
-/// the embedding side means a memory row exists with no embedding -- since
-/// `store_with_options_id()` always writes both in one SQLite transaction,
-/// this is only reachable via external corruption of the file, and is
-/// reported as such rather than silently dropped from the index. The
-/// active-only filter narrows *which* rows are considered; it never changes
-/// that corruption detection outcome for whatever rows do match.
-///
-/// Expiration boundary: `expires_at <= now` is expired, same convention as
-/// `purge_expired()`, recall filtering, and `update()`'s revival guard.
-///
-/// `BackfillPolicy::ExistingOnly` returns immediately, before reading
-/// anything: "do not touch the remote store" means zero local work too,
-/// not "validate everything and then no-op."
-///
-/// The read phase (when it runs) is fully synchronous and collects into a
-/// `Vec` before any `.await`, so no `MutexGuard` is ever held across an
-/// await point.
 async fn reconcile_vector_index(
     conn: &Mutex<Connection>,
     store: &Arc<dyn VectorStore>,
@@ -1004,7 +700,7 @@ async fn reconcile_vector_index(
             });
         }
         out
-    }; // conn guard dropped here -- before any await below
+    };
 
     match policy {
         BackfillPolicy::ExistingOnly => unreachable!("handled by the early return above"),
@@ -1018,13 +714,6 @@ async fn reconcile_vector_index(
     }
 }
 
-/// Converts a SQLite row from the `memories` table into a [`Memory`].
-///
-/// M6 note: this reads 11 columns, matching `MEMORY_COLUMNS`. A parse
-/// failure on the `confidence` column (index 10) surfaces as a proper
-/// `rusqlite::Error::FromSqlConversionFailure` via `to_sql_conversion_err`,
-/// the same treatment every other column here already gets -- corrupt data
-/// is never silently coerced into a default value.
 fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| to_sql_conversion_err(0, e))?;
@@ -1105,10 +794,6 @@ mod tests {
     async fn open_test_engine() -> MemoryEngine {
         MemoryEngine::open(":memory:").await.unwrap()
     }
-
-    // ---------------------------------------------------------------
-    // M3 tests (store/get/forget/restart/corruption/compensation)
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn store_persists_an_embedding_of_the_right_dimension() {
@@ -1287,9 +972,6 @@ mod tests {
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 
-    /// A `VectorStore` test double whose `insert` always fails, used to
-    /// prove `store_with_options_id()`'s compensation path actually
-    /// deletes the orphaned SQLite rows rather than leaving them behind.
     struct AlwaysFailsInsert;
 
     #[async_trait]
@@ -1355,10 +1037,6 @@ mod tests {
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 
-    /// A `VectorStore` test double whose `delete` always fails, used to
-    /// prove `forget()`'s error-surfacing convention: the *original*
-    /// vector-store error is returned even after a successful best-effort
-    /// `reconcile_vector_index` repair.
     struct AlwaysFailsDelete;
 
     #[async_trait]
@@ -1437,10 +1115,6 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
-
-    // ---------------------------------------------------------------
-    // M4 tests (recall_query)
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn recall_query_excludes_a_filtered_out_memory_type() {
@@ -1610,10 +1284,6 @@ mod tests {
         std::fs::remove_file(&path).expect("failed to remove temp db file");
     }
 
-    // ---------------------------------------------------------------
-    // M5 tests (store_with_options / ExpiryPolicy / update / supersede)
-    // ---------------------------------------------------------------
-
     #[tokio::test]
     async fn store_with_options_persists_metadata_in_both_sqlite_and_vector_store() {
         let engine = MemoryEngine::open(":memory:")
@@ -1634,9 +1304,6 @@ mod tests {
         let stored = engine.get(&id).await.unwrap().expect("memory should exist");
         assert_eq!(stored.metadata, metadata);
 
-        // metadata_equals filter should now match, proving the vector-store
-        // side (which recall_query doesn't read metadata from directly, but
-        // whose insert call received it) didn't diverge from SQLite's copy.
         let result = engine
             .recall_query(
                 RecallQuery::new("has custom metadata")
@@ -1797,9 +1464,6 @@ mod tests {
         assert!(matches!(result, Err(MemoliteError::InvalidUuid(_))));
     }
 
-    /// Fixes the M5 review finding: calling `update()` a second time on an
-    /// already-superseded memory must be rejected, not silently re-point
-    /// the supersession chain.
     #[tokio::test]
     async fn update_on_an_already_superseded_memory_is_rejected() {
         let engine = MemoryEngine::open(":memory:")
@@ -1817,8 +1481,6 @@ mod tests {
         };
         let v2_id = engine.update(&original_id, first_update).await.unwrap();
 
-        // Trying to update the now-superseded v1 again must fail, and must
-        // not touch v1's superseded_by link (still points at v2).
         let second_update_on_v1 = MemoryUpdate {
             new_content: Some("v1-attempted-again".to_string()),
             ..Default::default()
@@ -1829,7 +1491,6 @@ mod tests {
         let v1 = engine.get(&original_id).await.unwrap().unwrap();
         assert_eq!(v1.superseded_by, Some(Uuid::parse_str(&v2_id).unwrap()));
 
-        // Updating v2 (the current version) must still work fine.
         let update_v2 = MemoryUpdate {
             new_content: Some("v3".to_string()),
             ..Default::default()
@@ -1839,9 +1500,6 @@ mod tests {
         assert_eq!(v3.content, "v3");
     }
 
-    /// Direct unit test of `mark_superseded`'s atomic guard: manually
-    /// racing it against an already-completed supersession must fail with
-    /// `InvalidArgument`, not silently overwrite the existing link.
     #[tokio::test]
     async fn mark_superseded_rejects_a_second_call_against_the_same_source_id() {
         let engine = MemoryEngine::open(":memory:")
@@ -1926,11 +1584,6 @@ mod tests {
             .iter()
             .any(|i| i.memory.id == Uuid::parse_str(&old_id).unwrap()));
     }
-
-    // ---------------------------------------------------------------
-    // M6 tests (confidence: defaults, persistence, ranking weight,
-    // promotion on repeated recall, update-reinterpretation semantics)
-    // ---------------------------------------------------------------
 
     #[tokio::test]
     async fn store_defaults_to_explicit_confidence() {
@@ -2041,7 +1694,6 @@ mod tests {
             }
         }
 
-        // Further recalls keep it reinforced, never demote it.
         let result = engine
             .recall_query(RecallQuery::new("tabs over spaces").limit(1))
             .await

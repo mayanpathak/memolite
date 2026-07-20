@@ -6,59 +6,6 @@
 
 
 
-// //! Recall-time constants and helpers that don't depend on anything defined
-// //! later than Step 0.
-// //!
-// //! `RecallQuery`/`RecallItem`/`RecallResult` and `recall_query()` itself
-// //! are introduced in M4 and will live in this same module.
-
-// /// Hard ceiling on how many nearest-neighbor hits `recall_query()` ever
-// /// pulls from a `VectorStore` in one call.
-// pub const MAX_CANDIDATES: usize = 500;
-
-// /// Default number of results a recall call returns once eligibility
-// /// filtering and truncation have been applied. M3's temporary `recall()`
-// /// uses this directly; M4's `RecallQuery` will expose it as an overridable
-// /// default rather than a hard-coded `10` scattered through the engine.
-// pub const DEFAULT_RECALL_LIMIT: usize = 10;
-
-// /// Calculates the candidate pool requested from the vector store before
-// /// later filtering narrows the result set.
-// pub fn candidate_pool_size(limit: usize) -> usize {
-//     limit.saturating_mul(5).clamp(50, MAX_CANDIDATES)
-// }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[test]
-//     fn pool_size_is_bounded_and_monotonic() {
-//         assert_eq!(candidate_pool_size(0), 50);
-//         assert_eq!(candidate_pool_size(10), 50);
-//         assert_eq!(candidate_pool_size(100), 500);
-//         assert_eq!(candidate_pool_size(1000), MAX_CANDIDATES);
-//     }
-// }
-
-
-
-
-
-
-
-
-
-
-
-//! Recall-time types and constants.
-//!
-//! Step 0 defined `MAX_CANDIDATES`/`DEFAULT_RECALL_LIMIT`/`candidate_pool_size`
-//! and M3's temporary `recall()` used `DEFAULT_RECALL_LIMIT` directly. M4
-//! adds `RecallQuery`/`RecallItem`/`RecallResult`: `RecallQuery::new(text)`
-//! now exposes that same default as an overridable field instead of a
-//! hard-coded `10` scattered through the engine.
-
 use std::collections::HashMap;
 
 use serde_json::Value;
