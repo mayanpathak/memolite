@@ -1,29 +1,30 @@
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
-
+ 
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
-
+ 
 use crate::confidence::ConfidenceLevel;
 use crate::embedder::Embedder;
 use crate::error::{MemoliteError, Result};
 use crate::memory::{Memory, MemoryType};
 use crate::requests::{ExpiryPolicy, MemoryUpdate, StoreRequest};
 use crate::vector_store::{InMemoryVectorStore, VectorEntry, VectorStore};
-
+ 
 const MEMORY_COLUMNS: &str = "id, content, type, importance, access_count, \
     created_at, last_accessed, expires_at, superseded_by, metadata, confidence";
-
+ 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillPolicy {
     ExistingOnly,
     UpsertLocal,
     ReplaceAll,
 }
-
+ 
 pub struct MemoryEngine {
     conn: Mutex<Connection>,
     embedder: Mutex<Embedder>,
@@ -31,12 +32,12 @@ pub struct MemoryEngine {
     #[allow(dead_code)]
     maintenance_running: Arc<AtomicBool>,
 }
-
+ 
 impl MemoryEngine {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_store_internal(path, None, BackfillPolicy::ReplaceAll).await
     }
-
+ 
     pub(crate) async fn open_with_store_internal(
         path: impl AsRef<Path>,
         store_override: Option<Arc<dyn VectorStore>>,
@@ -44,10 +45,10 @@ impl MemoryEngine {
     ) -> Result<Self> {
         let mut raw_conn = Connection::open(path)?;
         crate::migrations::run_migrations(&mut raw_conn)?;
-
+ 
         let embedder = Embedder::new()?;
         let dim = embedder.dimension();
-
+ 
         let vector_store: Arc<dyn VectorStore> = match store_override {
             Some(store) => {
                 if store.dimension() != dim {
@@ -61,10 +62,10 @@ impl MemoryEngine {
             }
             None => Arc::new(InMemoryVectorStore::new(dim)),
         };
-
+ 
         let conn = Mutex::new(raw_conn);
         reconcile_vector_index(&conn, &vector_store, backfill).await?;
-
+ 
         Ok(Self {
             conn,
             embedder: Mutex::new(embedder),
@@ -72,7 +73,7 @@ impl MemoryEngine {
             maintenance_running: Arc::new(AtomicBool::new(false)),
         })
     }
-
+ 
     pub async fn store(
         &self,
         content: &str,
@@ -82,13 +83,13 @@ impl MemoryEngine {
         self.store_with_options(StoreRequest::new(content, memory_type, importance))
             .await
     }
-
+ 
     pub async fn store_with_options(&self, request: StoreRequest) -> Result<String> {
         self.store_with_options_id(request)
             .await
             .map(|id| id.to_string())
     }
-
+ 
     async fn store_with_options_id(&self, request: StoreRequest) -> Result<Uuid> {
         if request.content.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
@@ -107,7 +108,7 @@ impl MemoryEngine {
                 ));
             }
         }
-
+ 
         let id = Uuid::new_v4();
         let id_str = id.to_string();
         let created_at = Utc::now();
@@ -117,7 +118,7 @@ impl MemoryEngine {
             ExpiryPolicy::TypeDefault => Some(created_at + request.memory_type.default_ttl()),
         };
         let metadata_json = serde_json::to_string(&request.metadata)?;
-
+ 
         let vector = {
             let mut embedder = self
                 .embedder
@@ -128,13 +129,13 @@ impl MemoryEngine {
         let dimension = vector.len();
         let encoded_vector = bincode::serialize(&vector)
             .map_err(|e| MemoliteError::EmbeddingEncode(e.to_string()))?;
-
+ 
         {
             let mut conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-
+ 
             let tx = conn.transaction()?;
             tx.execute(
                 r#"
@@ -161,7 +162,7 @@ impl MemoryEngine {
             )?;
             tx.commit()?;
         }
-
+ 
         let store = {
             let guard = self
                 .vector_store
@@ -169,7 +170,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
-
+ 
         if let Err(e) = store.insert(id, &vector, request.metadata.clone()).await {
             let compensation = {
                 let conn = self
@@ -190,23 +191,23 @@ impl MemoryEngine {
             }
             return Err(e);
         }
-
+ 
         Ok(id)
     }
-
+ 
     pub async fn recall(&self, query: &str) -> Result<Vec<Memory>> {
         let result = self
             .recall_query(crate::recall::RecallQuery::new(query))
             .await?;
         Ok(result.items.into_iter().map(|i| i.memory).collect())
     }
-
+ 
     pub async fn recall_query(
         &self,
         query: crate::recall::RecallQuery,
     ) -> Result<crate::recall::RecallResult> {
         use crate::recall::{RecallItem, RecallResult};
-
+ 
         if query.query_text.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
                 "query_text must not be empty".into(),
@@ -220,7 +221,18 @@ impl MemoryEngine {
                 "min_importance must be finite".into(),
             ));
         }
-
+        // M7: an inverted [created_after, created_before] window can never
+        // match anything, so reject it up front rather than silently
+        // returning an empty result the caller might mistake for "no
+        // matches" instead of "malformed query".
+        if let (Some(after), Some(before)) = (query.created_after, query.created_before) {
+            if after > before {
+                return Err(MemoliteError::InvalidArgument(
+                    "created_after must not exceed created_before".into(),
+                ));
+            }
+        }
+ 
         let query_vector = {
             let mut embedder = self
                 .embedder
@@ -228,7 +240,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("embedder mutex poisoned".into()))?;
             embedder.embed(&query.query_text)?
         };
-
+ 
         let store = {
             let guard = self
                 .vector_store
@@ -236,17 +248,17 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
-
+ 
         let pool_size = crate::recall::candidate_pool_size(query.limit);
         let hits = store.search(&query_vector, pool_size).await?;
-
+ 
         if hits.is_empty() {
             return Ok(RecallResult { items: Vec::new() });
         }
-
+ 
         let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
         let now = Utc::now();
-
+ 
         let by_id = {
             let conn = self
                 .conn
@@ -254,13 +266,13 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             fetch_memories_by_ids(&conn, &hit_ids)?
         };
-
+ 
         let mut scored: Vec<RecallItem> = Vec::with_capacity(hits.len());
         for hit in &hits {
             let Some(memory) = by_id.get(&hit.id) else {
                 continue;
             };
-
+ 
             if memory.importance < query.min_importance {
                 continue;
             }
@@ -282,11 +294,36 @@ impl MemoryEngine {
             {
                 continue;
             }
-
+            // M7: creation-window filters.
+            if let Some(after) = query.created_after {
+                if memory.created_at < after {
+                    continue;
+                }
+            }
+            if let Some(before) = query.created_before {
+                if memory.created_at > before {
+                    continue;
+                }
+            }
+ 
             let days_since_access = (now - memory.last_accessed).num_seconds() as f64 / 86400.0;
             let recency = crate::ranking::recency_factor(days_since_access, memory.memory_type);
             let reinforcement = crate::ranking::reinforcement_factor(memory.access_count);
             let confidence_weight = memory.confidence.weight();
+ 
+            // M7: stale-only filter. A memory is "stale" once it has gone
+            // twice its type's decay half-life without being touched. This
+            // must reuse ranking::decay_half_life_days rather than invent a
+            // second cutoff, so find_stale_memories() and this filter can
+            // never silently disagree about what "stale" means.
+            if query.only_stale {
+                let stale_cutoff_days =
+                    crate::ranking::decay_half_life_days(memory.memory_type) * 2.0;
+                if days_since_access < stale_cutoff_days {
+                    continue;
+                }
+            }
+ 
             let score = crate::ranking::final_score(
                 hit.score,
                 memory.importance,
@@ -294,25 +331,25 @@ impl MemoryEngine {
                 reinforcement,
                 confidence_weight,
             );
-
+ 
             scored.push(RecallItem {
                 memory: memory.clone(),
                 similarity: hit.score,
                 score,
             });
         }
-
+ 
         scored.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| a.memory.id.cmp(&b.memory.id))
         });
         scored.truncate(query.limit);
-
+ 
         if scored.is_empty() {
             return Ok(RecallResult { items: Vec::new() });
         }
-
+ 
         let bumped_ids: Vec<Uuid> = scored.iter().map(|i| i.memory.id).collect();
         {
             let mut conn = self
@@ -321,7 +358,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             let tx = conn.transaction()?;
             let now_ts = now.timestamp();
-
+ 
             let id_placeholders = (0..bumped_ids.len())
                 .map(|i| format!("?{}", i + 2))
                 .collect::<Vec<_>>()
@@ -336,7 +373,7 @@ impl MemoryEngine {
                  WHERE id IN ({id_placeholders})",
                 threshold = ConfidenceLevel::PROMOTION_THRESHOLD,
             );
-
+ 
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_ts)];
             for id in &bumped_ids {
                 params_vec.push(Box::new(id.to_string()));
@@ -346,7 +383,7 @@ impl MemoryEngine {
             tx.execute(&sql, params_refs.as_slice())?;
             tx.commit()?;
         }
-
+ 
         let refetched = {
             let conn = self
                 .conn
@@ -359,32 +396,32 @@ impl MemoryEngine {
                 item.memory = m.clone();
             }
         }
-
+ 
         Ok(RecallResult { items: scored })
     }
-
+ 
     pub async fn get(&self, id: &str) -> Result<Option<Memory>> {
         let uuid = Uuid::parse_str(id)?;
-
+ 
         let conn = self
             .conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-
+ 
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1");
         let memory = conn
             .query_row(&sql, params![uuid.to_string()], row_to_memory)
             .optional()?;
-
+ 
         Ok(memory)
     }
-
+ 
     pub async fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-
+ 
         let row: Option<(Vec<u8>, i64)> = conn
             .query_row(
                 "SELECT vector, dimension FROM embeddings WHERE memory_id = ?1",
@@ -393,34 +430,34 @@ impl MemoryEngine {
             )
             .optional()?;
         drop(conn);
-
+ 
         let Some((blob, stored_dim)) = row else {
             return Ok(None);
         };
-
+ 
         let vector: Vec<f32> = bincode::deserialize(&blob)
             .map_err(|e| MemoliteError::EmbeddingDecode(e.to_string()))?;
-
+ 
         if vector.len() != stored_dim as usize {
             return Err(MemoliteError::Corruption(format!(
                 "embedding for {memory_id} has {} floats but its row says dimension {stored_dim}",
                 vector.len()
             )));
         }
-
+ 
         Ok(Some(vector))
     }
-
+ 
     pub fn dimension(&self) -> usize {
         self.embedder
             .lock()
             .expect("embedder mutex poisoned")
             .dimension()
     }
-
+ 
     pub async fn forget(&self, id: &str) -> Result<()> {
         let uuid = Uuid::parse_str(id)?;
-
+ 
         {
             let conn = self
                 .conn
@@ -428,7 +465,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         }
-
+ 
         let store = {
             let guard = self
                 .vector_store
@@ -436,7 +473,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
-
+ 
         if let Err(e) = store.delete(uuid).await {
             if let Err(reconcile_err) =
                 reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
@@ -448,24 +485,24 @@ impl MemoryEngine {
             }
             return Err(e);
         }
-
+ 
         Ok(())
     }
-
+ 
     pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
         let uuid = Uuid::parse_str(id)?;
         let old = self
             .get(id)
             .await?
             .ok_or_else(|| MemoliteError::NotFound(id.to_string()))?;
-
+ 
         if old.superseded_by.is_some() {
             return Err(MemoliteError::InvalidArgument(format!(
                 "memory {id} has already been superseded and cannot be updated directly; \
                  update the memory it was superseded by instead"
             )));
         }
-
+ 
         let now = Utc::now();
         let is_expired = old.expires_at.map(|e| e <= now).unwrap_or(false);
         if is_expired && update.new_expiry.is_none() {
@@ -473,7 +510,7 @@ impl MemoryEngine {
                 "memory is expired; supply new_expiry explicitly to revive it".into(),
             ));
         }
-
+ 
         let mut request = StoreRequest::new(
             &update.new_content.unwrap_or_else(|| old.content.clone()),
             update.new_memory_type.unwrap_or(old.memory_type),
@@ -481,13 +518,15 @@ impl MemoryEngine {
         );
         request.expiry = update.new_expiry.unwrap_or(match old.expires_at {
             None => ExpiryPolicy::Never,
-            Some(old_expires_at) => ExpiryPolicy::Custom(old_expires_at.signed_duration_since(now)),
+            Some(old_expires_at) => {
+                ExpiryPolicy::Custom(old_expires_at.signed_duration_since(now))
+            }
         });
         request.metadata = update.new_metadata.unwrap_or_else(|| old.metadata.clone());
         request.confidence = update.new_confidence.unwrap_or(ConfidenceLevel::Inferred);
-
+ 
         let new_uuid = self.store_with_options_id(request).await?;
-
+ 
         if let Err(e) = self.mark_superseded(&uuid, &new_uuid.to_string()) {
             let del_err = {
                 let conn = self
@@ -511,7 +550,7 @@ impl MemoryEngine {
                 Arc::clone(&*guard)
             };
             let vec_err = store.delete(new_uuid).await.err();
-
+ 
             if del_err.is_some() || vec_err.is_some() {
                 return Err(MemoliteError::CompensationFailed {
                     operation: e.to_string(),
@@ -520,28 +559,28 @@ impl MemoryEngine {
             }
             return Err(e);
         }
-
+ 
         Ok(new_uuid.to_string())
     }
-
+ 
     fn mark_superseded(&self, old_id: &Uuid, new_id: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-
+ 
         let affected = conn.execute(
             "UPDATE memories SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL",
             params![new_id, old_id.to_string()],
         )?;
-
+ 
         if affected == 0 {
             let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
                 params![old_id.to_string()],
                 |r| r.get(0),
             )?;
-
+ 
             if exists {
                 return Err(MemoliteError::InvalidArgument(format!(
                     "memory {old_id} was already superseded by another update (concurrent update race)"
@@ -549,33 +588,33 @@ impl MemoryEngine {
             }
             return Err(MemoliteError::NotFound(old_id.to_string()));
         }
-
+ 
         Ok(())
     }
-
+ 
     pub async fn purge_expired(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
-
+ 
         let deleted_ids: Vec<String> = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-
+ 
             let mut stmt = conn.prepare(
                 "DELETE FROM memories
                  WHERE expires_at IS NOT NULL AND expires_at <= ?1
                  RETURNING id",
             )?;
-
+ 
             stmt.query_map(params![now], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-
+ 
         if deleted_ids.is_empty() {
             return Ok(0);
         }
-
+ 
         let store = {
             let guard = self
                 .vector_store
@@ -583,9 +622,9 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
-
+ 
         let mut vector_errors = Vec::new();
-
+ 
         for id in &deleted_ids {
             if let Ok(uuid) = Uuid::parse_str(id) {
                 if let Err(error) = store.delete(uuid).await {
@@ -593,7 +632,7 @@ impl MemoryEngine {
                 }
             }
         }
-
+ 
         if !vector_errors.is_empty() {
             let combined = vector_errors.join("; ");
             if let Err(reconcile_error) =
@@ -606,39 +645,177 @@ impl MemoryEngine {
             }
             return Err(MemoliteError::VectorStore(combined));
         }
-
+ 
         Ok(deleted_ids.len())
     }
+ 
+    // ---------------------------------------------------------------
+    // M7 — temporal querying
+    //
+    // Everything below is a pure SQLite read: no embedder call, no
+    // vector-store call, no lock ever held across an `.await`. These
+    // methods exist for direct audit/inspection of the database and are
+    // orthogonal to semantic recall — `RecallQuery`'s `created_after`/
+    // `created_before`/`only_stale` filters (wired in above, inside
+    // `recall_query`) are the semantic-search-facing equivalent of the
+    // same concepts.
+    // ---------------------------------------------------------------
+ 
+    /// Every memory created within `[start, end]`, inclusive, ordered by
+    /// creation time ascending. A pure SQLite range scan — does not touch
+    /// the embedder or vector store.
+    pub async fn query_by_time_range(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<Memory>> {
+        if start > end {
+            return Err(MemoliteError::InvalidArgument(
+                "start must not be after end".into(),
+            ));
+        }
+ 
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories \
+             WHERE created_at >= ?1 AND created_at <= ?2 \
+             ORDER BY created_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![start.timestamp(), end.timestamp()], row_to_memory)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+ 
+    /// Every memory *created or accessed* since `since`, most recent
+    /// creation first.
+    ///
+    /// Recalling a memory bumps `last_accessed`, so a pure read can
+    /// legitimately make an old memory show up here — that's intentional,
+    /// not a bug: this method answers "what's touched the database since
+    /// this point", not "what's been edited". A true edit-only audit would
+    /// need a separate `updated_at` column bumped only by `update()`; that
+    /// column does not exist yet and is a stated follow-up, not something
+    /// this method claims to already provide.
+    pub async fn created_or_accessed_since(&self, since: DateTime<Utc>) -> Result<Vec<Memory>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories \
+             WHERE created_at >= ?1 OR last_accessed >= ?1 \
+             ORDER BY created_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since.timestamp()], row_to_memory)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+ 
+    /// Every *active* memory (not superseded, not expired) that hasn't
+    /// been accessed in at least twice its type's decay half-life.
+    ///
+    /// Uses the exact same "active" definition as the live vector index
+    /// (`get_active_memories`, below) and the exact same staleness cutoff
+    /// as `RecallQuery::only_stale`'s in-loop filter above, so all three
+    /// can never silently disagree about what "stale" or "active" means.
+    pub async fn find_stale_memories(&self) -> Result<Vec<Memory>> {
+        let now = Utc::now();
+        let active = self.get_active_memories()?;
+        Ok(active
+            .into_iter()
+            .filter(|m| {
+                let cutoff_days = crate::ranking::decay_half_life_days(m.memory_type) * 2.0;
+                let days_since_access = (now - m.last_accessed).num_seconds() as f64 / 86400.0;
+                days_since_access >= cutoff_days
+            })
+            .collect())
+    }
+ 
+    /// Not-superseded, not-(already-)expired memories. Synchronous SQLite
+    /// helper shared by `find_stale_memories`; kept private since it's an
+    /// implementation detail of "what counts as active", not a public
+    /// query shape on its own.
+    fn get_active_memories(&self) -> Result<Vec<Memory>> {
+        let now = Utc::now().timestamp();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+        let sql = format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories \
+             WHERE superseded_by IS NULL AND (expires_at IS NULL OR expires_at > ?1)"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![now], row_to_memory)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+ 
+    /// Walks a memory's `superseded_by` chain forward from `id` to its
+    /// current version, inclusive of both ends. `id` may be any memory in
+    /// the chain, not just the original.
+    ///
+    /// Guards against a corrupted (cyclic) `superseded_by` chain, which
+    /// `update()`'s own API can never produce but a hand-edited database
+    /// could: after 10,000 hops it fails loudly with `Internal` rather than
+    /// looping forever.
+    pub async fn find_superseded_chain(&self, id: &str) -> Result<Vec<Memory>> {
+        let start_uuid = Uuid::parse_str(id)?;
+        let mut chain = Vec::new();
+        let mut current = self
+            .get(id)
+            .await?
+            .ok_or_else(|| MemoliteError::NotFound(id.to_string()))?;
+        chain.push(current.clone());
+ 
+        let mut guard_iterations = 0usize;
+        while let Some(next_id) = current.superseded_by {
+            guard_iterations += 1;
+            if guard_iterations > 10_000 {
+                return Err(MemoliteError::Internal(format!(
+                    "superseded_by cycle detected starting from {start_uuid}"
+                )));
+            }
+            let Some(next) = self.get(&next_id.to_string()).await? else {
+                break;
+            };
+            chain.push(next.clone());
+            current = next;
+        }
+        Ok(chain)
+    }
 }
-
+ 
 fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid, Memory>> {
     let mut result = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
         return Ok(result);
     }
-
+ 
     let id_placeholders = (0..ids.len())
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({id_placeholders})");
-
+ 
     let params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
         .iter()
         .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::ToSql>)
         .collect();
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-
+ 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_refs.as_slice(), row_to_memory)?;
     for row in rows {
         let memory = row?;
         result.insert(memory.id, memory);
     }
-
+ 
     Ok(result)
 }
-
+ 
 async fn reconcile_vector_index(
     conn: &Mutex<Connection>,
     store: &Arc<dyn VectorStore>,
@@ -647,14 +824,14 @@ async fn reconcile_vector_index(
     if policy == BackfillPolicy::ExistingOnly {
         return Ok(());
     }
-
+ 
     let now = Utc::now().timestamp();
-
+ 
     let entries: Vec<VectorEntry> = {
         let conn = conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
-
+ 
         let mut stmt = conn.prepare(
             "SELECT m.id, e.vector, e.dimension, m.metadata
              FROM memories m LEFT JOIN embeddings e ON e.memory_id = m.id
@@ -669,18 +846,18 @@ async fn reconcile_vector_index(
                 row.get::<_, String>(3)?,
             ))
         })?;
-
+ 
         let mut out = Vec::new();
         for row in rows {
             let (id_str, bytes, stored_dim, metadata_json) = row?;
             let id = Uuid::parse_str(&id_str)?;
-
+ 
             let (Some(bytes), Some(stored_dim)) = (bytes, stored_dim) else {
                 return Err(MemoliteError::Corruption(format!(
                     "memory {id} has no matching embedding row"
                 )));
             };
-
+ 
             let vector: Vec<f32> = bincode::deserialize(&bytes)
                 .map_err(|e| MemoliteError::EmbeddingDecode(e.to_string()))?;
             if vector.len() != stored_dim as usize {
@@ -690,7 +867,7 @@ async fn reconcile_vector_index(
                     stored_dim
                 )));
             }
-
+ 
             let metadata: HashMap<String, serde_json::Value> =
                 serde_json::from_str(&metadata_json)?;
             out.push(VectorEntry {
@@ -701,7 +878,7 @@ async fn reconcile_vector_index(
         }
         out
     };
-
+ 
     match policy {
         BackfillPolicy::ExistingOnly => unreachable!("handled by the early return above"),
         BackfillPolicy::UpsertLocal => {
@@ -713,46 +890,46 @@ async fn reconcile_vector_index(
         BackfillPolicy::ReplaceAll => store.replace_all(entries).await,
     }
 }
-
+ 
 fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| to_sql_conversion_err(0, e))?;
-
+ 
     let content: String = row.get(1)?;
-
+ 
     let type_str: String = row.get(2)?;
     let memory_type = MemoryType::parse_str(&type_str).map_err(|e| to_sql_conversion_err(2, e))?;
-
+ 
     let importance: f32 = row.get(3)?;
-
+ 
     let access_count: i64 = row.get(4)?;
     let access_count = access_count as u32;
-
+ 
     let created_at_ts: i64 = row.get(5)?;
     let created_at = timestamp_to_datetime(created_at_ts, 5)?;
-
+ 
     let last_accessed_ts: i64 = row.get(6)?;
     let last_accessed = timestamp_to_datetime(last_accessed_ts, 6)?;
-
+ 
     let expires_at_ts: Option<i64> = row.get(7)?;
     let expires_at = expires_at_ts
         .map(|ts| timestamp_to_datetime(ts, 7))
         .transpose()?;
-
+ 
     let superseded_by_str: Option<String> = row.get(8)?;
     let superseded_by = superseded_by_str
         .map(|s| Uuid::parse_str(&s))
         .transpose()
         .map_err(|e| to_sql_conversion_err(8, e))?;
-
+ 
     let metadata_str: String = row.get(9)?;
     let metadata: HashMap<String, serde_json::Value> =
         serde_json::from_str(&metadata_str).map_err(|e| to_sql_conversion_err(9, e))?;
-
+ 
     let confidence_str: String = row.get(10)?;
     let confidence =
         ConfidenceLevel::parse_str(&confidence_str).map_err(|e| to_sql_conversion_err(10, e))?;
-
+ 
     Ok(Memory {
         id,
         content,
@@ -767,14 +944,14 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
         confidence,
     })
 }
-
+ 
 fn to_sql_conversion_err<E>(col: usize, err: E) -> rusqlite::Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(err))
 }
-
+ 
 fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>> {
     Utc.timestamp_opt(ts, 0).single().ok_or_else(|| {
         to_sql_conversion_err(
@@ -1803,4 +1980,472 @@ mod tests {
             .unwrap();
         assert_eq!(results.items.len(), 3);
     }
+mod m7_tests {
+    use super::*;
+    use crate::recall::RecallQuery;
+ 
+    /// Opens a fresh MemoryEngine backed by a real temp-file SQLite
+    /// database (not `:memory:`, so the on-disk path matches production
+    /// behavior) that is deleted when the returned TempDir drops.
+    async fn test_engine() -> (MemoryEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("m7_test.db");
+        let engine = MemoryEngine::open(&db_path)
+            .await
+            .expect("failed to open engine");
+        (engine, dir)
+    }
+ 
+    /// Directly rewrites a row's `created_at`/`last_accessed` timestamps.
+    /// Only reachable via raw SQL — there is no public API that lets a
+    /// caller backdate a memory, which is exactly why these tests need
+    /// direct `conn` access and therefore live inside `engine.rs` rather
+    /// than in an external `tests/*.rs` file.
+    fn backdate(engine: &MemoryEngine, id: &str, days_ago: i64) {
+        let conn = engine.conn.lock().unwrap();
+        let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, last_accessed = ?1 WHERE id = ?2",
+            params![ts, id],
+        )
+        .unwrap();
+    }
+ 
+    fn backdate_last_accessed_only(engine: &MemoryEngine, id: &str, days_ago: i64) {
+        let conn = engine.conn.lock().unwrap();
+        let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
+        conn.execute(
+            "UPDATE memories SET last_accessed = ?1 WHERE id = ?2",
+            params![ts, id],
+        )
+        .unwrap();
+    }
+ 
+    // -----------------------------------------------------------------
+    // query_by_time_range
+    // -----------------------------------------------------------------
+ 
+    #[tokio::test]
+    async fn query_by_time_range_rejects_start_after_end() {
+        let (engine, _dir) = test_engine().await;
+        let now = Utc::now();
+        let err = engine
+            .query_by_time_range(now, now - chrono::Duration::days(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoliteError::InvalidArgument(_)));
+    }
+ 
+    #[tokio::test]
+    async fn query_by_time_range_accepts_a_single_instant_window() {
+        let (engine, _dir) = test_engine().await;
+        let now = Utc::now();
+        // start == end must be accepted, not rejected as "inverted".
+        let result = engine.query_by_time_range(now, now).await;
+        assert!(result.is_ok());
+    }
+ 
+    #[tokio::test]
+    async fn query_by_time_range_returns_only_the_window_in_order() {
+        let (engine, _dir) = test_engine().await;
+        let id_old = engine
+            .store("old fact about the weather", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        let id_new = engine
+            .store("new fact about the weather", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        backdate(&engine, &id_old, 10);
+ 
+        let window_start = Utc::now() - chrono::Duration::days(1);
+        let window_end = Utc::now() + chrono::Duration::minutes(1);
+        let results = engine
+            .query_by_time_range(window_start, window_end)
+            .await
+            .unwrap();
+ 
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.to_string(), id_new);
+    }
+ 
+    #[tokio::test]
+    async fn query_by_time_range_on_empty_engine_returns_empty() {
+        let (engine, _dir) = test_engine().await;
+        let now = Utc::now();
+        let results = engine
+            .query_by_time_range(now - chrono::Duration::days(1), now)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+ 
+    // -----------------------------------------------------------------
+    // RecallQuery.created_after / .created_before
+    // -----------------------------------------------------------------
+ 
+    #[tokio::test]
+    async fn recall_query_rejects_inverted_created_after_before() {
+        let (engine, _dir) = test_engine().await;
+        engine
+            .store("some fact for inversion test", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let err = engine
+            .recall_query(
+                RecallQuery::new("some fact for inversion test")
+                    .created_after(now)
+                    .created_before(now - chrono::Duration::days(1)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoliteError::InvalidArgument(_)));
+    }
+ 
+    #[tokio::test]
+    async fn recall_query_created_before_excludes_memories_created_after_cutoff() {
+        let (engine, _dir) = test_engine().await;
+        let id_early = engine
+            .store("shared topic alpha marker", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        backdate(&engine, &id_early, 5);
+ 
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+ 
+        let id_late = engine
+            .store("shared topic alpha marker again", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let results = engine
+            .recall_query(RecallQuery::new("shared topic alpha marker").created_before(cutoff))
+            .await
+            .unwrap();
+ 
+        let returned_ids: Vec<String> = results
+            .items
+            .iter()
+            .map(|i| i.memory.id.to_string())
+            .collect();
+        assert!(returned_ids.contains(&id_early));
+        assert!(!returned_ids.contains(&id_late));
+    }
+ 
+    #[tokio::test]
+    async fn recall_query_created_after_excludes_memories_created_before_cutoff() {
+        let (engine, _dir) = test_engine().await;
+        let id_early = engine
+            .store("beta marker early fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        backdate(&engine, &id_early, 5);
+ 
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+ 
+        let id_late = engine
+            .store("beta marker late fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let results = engine
+            .recall_query(RecallQuery::new("beta marker fact").created_after(cutoff))
+            .await
+            .unwrap();
+ 
+        let returned_ids: Vec<String> = results
+            .items
+            .iter()
+            .map(|i| i.memory.id.to_string())
+            .collect();
+        assert!(returned_ids.contains(&id_late));
+        assert!(!returned_ids.contains(&id_early));
+    }
+ 
+    // -----------------------------------------------------------------
+    // created_or_accessed_since
+    // -----------------------------------------------------------------
+ 
+    #[tokio::test]
+    async fn created_or_accessed_since_finds_a_recently_created_memory() {
+        let (engine, _dir) = test_engine().await;
+        let cutoff = Utc::now() - chrono::Duration::minutes(1);
+        let id = engine
+            .store("freshly created audit fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
+        assert!(recent.iter().any(|m| m.id.to_string() == id));
+    }
+ 
+    #[tokio::test]
+    async fn created_or_accessed_since_catches_a_fresh_recall_of_an_old_memory() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("audit me via recall bump", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        backdate(&engine, &id, 5);
+ 
+        let cutoff = Utc::now() - chrono::Duration::hours(1);
+ 
+        // recall() bumps last_accessed to "now", which should make this
+        // old memory show up in the "since cutoff" window even though it
+        // was created 5 days ago.
+        engine.recall("audit me via recall bump").await.unwrap();
+ 
+        let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
+        assert!(recent.iter().any(|m| m.id.to_string() == id));
+    }
+ 
+    #[tokio::test]
+    async fn created_or_accessed_since_excludes_untouched_old_memories() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("never touched again fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        backdate(&engine, &id, 5);
+ 
+        let cutoff = Utc::now() - chrono::Duration::hours(1);
+        let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
+        assert!(!recent.iter().any(|m| m.id.to_string() == id));
+    }
+ 
+    // -----------------------------------------------------------------
+    // find_stale_memories / RecallQuery.only_stale
+    // -----------------------------------------------------------------
+ 
+    #[tokio::test]
+    async fn find_stale_memories_respects_the_memory_types_decay_cutoff() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("stale candidate episodic", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+ 
+        // Episodic half-life is 14 days -> stale cutoff is 28 days.
+        backdate_last_accessed_only(&engine, &id, 29);
+ 
+        let stale = engine.find_stale_memories().await.unwrap();
+        assert!(stale.iter().any(|m| m.id.to_string() == id));
+    }
+ 
+    #[tokio::test]
+    async fn find_stale_memories_excludes_recently_accessed_memories() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("fresh episodic memory", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        // Well under the 28-day episodic staleness cutoff.
+        backdate_last_accessed_only(&engine, &id, 1);
+ 
+        let stale = engine.find_stale_memories().await.unwrap();
+        assert!(!stale.iter().any(|m| m.id.to_string() == id));
+    }
+ 
+    #[tokio::test]
+    async fn find_stale_memories_excludes_superseded_memories() {
+        let (engine, _dir) = test_engine().await;
+        let id_a = engine
+            .store("superseded stale candidate", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        backdate_last_accessed_only(&engine, &id_a, 29);
+ 
+        let _id_b = engine
+            .update(
+                &id_a,
+                MemoryUpdate {
+                    new_content: Some("replacement content".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+ 
+        let stale = engine.find_stale_memories().await.unwrap();
+        // id_a is now superseded, so it must not appear even though it
+        // would otherwise pass the staleness cutoff.
+        assert!(!stale.iter().any(|m| m.id.to_string() == id_a));
+    }
+ 
+    #[tokio::test]
+    async fn only_stale_filter_agrees_with_find_stale_memories() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("only stale filter marker fact", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        backdate_last_accessed_only(&engine, &id, 29);
+ 
+        // find_stale_memories() must run FIRST: recall_query() bumps
+        // access_count/last_accessed on every item it returns, regardless
+        // of which filter let that item through. Calling recall_query()
+        // first would reset last_accessed to "now" as a side effect of
+        // successfully recalling the stale memory, un-staling it before
+        // find_stale_memories() gets a chance to observe it. That bump is
+        // correct production behavior (an access is an access) -- it's
+        // this test's ordering that has to respect it.
+        let via_find_stale = engine.find_stale_memories().await.unwrap();
+        assert!(via_find_stale.iter().any(|m| m.id.to_string() == id));
+ 
+        let via_recall = engine
+            .recall_query(RecallQuery::new("only stale filter marker fact").only_stale(true))
+            .await
+            .unwrap();
+        assert!(via_recall.items.iter().any(|i| i.memory.id.to_string() == id));
+    }
+ 
+    #[tokio::test]
+    async fn only_stale_false_by_default_includes_fresh_memories() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("default recall includes fresh fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let results = engine
+            .recall("default recall includes fresh fact")
+            .await
+            .unwrap();
+        assert!(results.iter().any(|m| m.id.to_string() == id));
+    }
+ 
+    // -----------------------------------------------------------------
+    // find_superseded_chain
+    // -----------------------------------------------------------------
+ 
+    #[tokio::test]
+    async fn find_superseded_chain_walks_three_generations() {
+        let (engine, _dir) = test_engine().await;
+        let id_a = engine
+            .store("chain v1", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        let id_b = engine
+            .update(
+                &id_a,
+                MemoryUpdate {
+                    new_content: Some("chain v2".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let id_c = engine
+            .update(
+                &id_b,
+                MemoryUpdate {
+                    new_content: Some("chain v3".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+ 
+        let chain = engine.find_superseded_chain(&id_a).await.unwrap();
+        let ids: Vec<String> = chain.iter().map(|m| m.id.to_string()).collect();
+        assert_eq!(ids, vec![id_a, id_b, id_c]);
+    }
+ 
+    #[tokio::test]
+    async fn find_superseded_chain_from_a_middle_link_returns_only_the_remaining_tail() {
+        let (engine, _dir) = test_engine().await;
+        let id_a = engine
+            .store("mid-chain v1", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        let id_b = engine
+            .update(
+                &id_a,
+                MemoryUpdate {
+                    new_content: Some("mid-chain v2".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let id_c = engine
+            .update(
+                &id_b,
+                MemoryUpdate {
+                    new_content: Some("mid-chain v3".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+ 
+        // Starting from the middle link should NOT include id_a.
+        let chain = engine.find_superseded_chain(&id_b).await.unwrap();
+        let ids: Vec<String> = chain.iter().map(|m| m.id.to_string()).collect();
+        assert_eq!(ids, vec![id_b, id_c]);
+    }
+ 
+    #[tokio::test]
+    async fn find_superseded_chain_on_a_never_updated_memory_is_a_single_element_chain() {
+        let (engine, _dir) = test_engine().await;
+        let id = engine
+            .store("never updated", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let chain = engine.find_superseded_chain(&id).await.unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id.to_string(), id);
+    }
+ 
+    #[tokio::test]
+    async fn find_superseded_chain_on_a_nonexistent_id_is_not_found() {
+        let (engine, _dir) = test_engine().await;
+        let random_id = Uuid::new_v4().to_string();
+        let err = engine.find_superseded_chain(&random_id).await.unwrap_err();
+        assert!(matches!(err, MemoliteError::NotFound(_)));
+    }
+ 
+    #[tokio::test]
+    async fn find_superseded_chain_on_a_malformed_id_is_invalid_uuid() {
+        let (engine, _dir) = test_engine().await;
+        let err = engine
+            .find_superseded_chain("not-a-uuid")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemoliteError::InvalidUuid(_)));
+    }
+ 
+    #[tokio::test]
+    async fn find_superseded_chain_trips_the_cycle_guard_on_corrupted_data() {
+        let (engine, _dir) = test_engine().await;
+        let id_a = engine.store("cycle a", MemoryType::Semantic, 0.5).await.unwrap();
+        let id_b = engine.store("cycle b", MemoryType::Semantic, 0.5).await.unwrap();
+ 
+        // Hand-craft a cycle: a -> b -> a. Only reachable via raw SQL,
+        // since the public update() API can never produce this shape.
+        {
+            let conn = engine.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                params![id_b, id_a],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                params![id_a, id_b],
+            )
+            .unwrap();
+        }
+ 
+        let err = engine.find_superseded_chain(&id_a).await.unwrap_err();
+        assert!(matches!(err, MemoliteError::Internal(_)));
+    }
+}
+
+
+
+    
 }
