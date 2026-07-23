@@ -8,12 +8,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
  
+use crate::compression::{self, CompressionResult};
 use crate::confidence::ConfidenceLevel;
 use crate::embedder::Embedder;
 use crate::error::{MemoliteError, Result};
 use crate::memory::{Memory, MemoryType};
 use crate::requests::{ExpiryPolicy, MemoryUpdate, StoreRequest};
-use crate::vector_store::{InMemoryVectorStore, VectorEntry, VectorStore};
+use crate::vector_store::{validate_vector, InMemoryVectorStore, VectorEntry, VectorStore};
  
 const MEMORY_COLUMNS: &str = "id, content, type, importance, access_count, \
     created_at, last_accessed, expires_at, superseded_by, metadata, confidence";
@@ -786,6 +787,187 @@ impl MemoryEngine {
         }
         Ok(chain)
     }
+ 
+    // ---------------------------------------------------------------
+    // M9 — compression + index rebuild
+    //
+    // `compress_old_memories` is the only method here that touches the
+    // embedder/vector-store *and* SQLite together; the rest are thin,
+    // synchronous SQLite helpers or a one-line delegation into
+    // `reconcile_vector_index` (Step 0.8 / the top of this file).
+    // ---------------------------------------------------------------
+ 
+    /// All episodic memories with `created_at <= now - days`. A pure
+    /// SQLite range scan, reused by `compress_old_memories` as the first,
+    /// cheap filter before the more expensive eligibility/embedding checks.
+    fn get_episodic_memories_older_than(&self, days: i64) -> Result<Vec<Memory>> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).timestamp();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+        let sql =
+            format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE type = 'episodic' AND created_at <= ?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![cutoff], row_to_memory)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+ 
+    /// Resynchronizes the entire vector index from SQLite via
+    /// `BackfillPolicy::ReplaceAll`. Useful for manual recovery if the
+    /// vector store is ever suspected to have drifted from SQLite (e.g.
+    /// after a hand-edited database, or a crash mid-compensation).
+    pub async fn rebuild_vector_index(&self) -> Result<()> {
+        let store = {
+            let guard = self
+                .vector_store
+                .read()
+                .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
+            Arc::clone(&*guard)
+        };
+        reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
+    }
+ 
+    /// Consolidates old, low-importance episodic memories into semantic
+    /// summaries.
+    ///
+    /// Candidates are episodic memories older than 14 days, filtered by
+    /// `compression::is_compression_eligible`. Every candidate *must* have
+    /// a persisted embedding (Step 5.4's invariant: `store_with_options_id`
+    /// always writes memory + embedding in one transaction) — a missing
+    /// embedding is treated as `Err(Corruption)`, never silently skipped.
+    ///
+    /// Candidates are clustered by cosine similarity (threshold `0.85`);
+    /// any cluster with 3+ members is summarized (extractively) into one
+    /// new `Semantic`/`Inferred` memory, and every original in that
+    /// cluster is marked `superseded_by` the new summary — recoverable via
+    /// `RecallQuery::include_superseded(true)`, never deleted.
+    ///
+    /// Returns the total number of *original* memories folded into a
+    /// summary (not the number of summaries created).
+    pub async fn compress_old_memories(&self) -> Result<usize> {
+        let candidates: Vec<Memory> = self
+            .get_episodic_memories_older_than(14)?
+            .into_iter()
+            .filter(compression::is_compression_eligible)
+            .collect();
+ 
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+ 
+        let expected_dim = {
+            let guard = self
+                .vector_store
+                .read()
+                .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
+            guard.dimension()
+        };
+ 
+        let mut with_vectors: Vec<(Uuid, Vec<f32>)> = Vec::with_capacity(candidates.len());
+        for m in &candidates {
+            // A candidate came straight out of `memories`, which — per
+            // Step 5.4's invariant — always has a matching embeddings row.
+            // A miss here means the database is corrupted, so this fails
+            // loudly instead of silently excluding the candidate from
+            // clustering.
+            let vector = self.get_embedding(&m.id.to_string()).await?.ok_or_else(|| {
+                MemoliteError::Corruption(format!(
+                    "memory {} has no persisted embedding",
+                    m.id
+                ))
+            })?;
+            validate_vector(&format!("embedding for {}", m.id), &vector, expected_dim)?;
+            with_vectors.push((m.id, vector));
+        }
+ 
+        let clusters = compression::greedy_cluster(&with_vectors, 0.85);
+        let mut compressed_count = 0usize;
+ 
+        for cluster in clusters.into_iter().filter(|c| c.member_ids.len() >= 3) {
+            let members: Vec<Memory> = candidates
+                .iter()
+                .filter(|m| cluster.member_ids.contains(&m.id))
+                .cloned()
+                .collect();
+ 
+            let CompressionResult {
+                summary_content,
+                original_ids,
+            } = compression::summarize_cluster(&members, 0.85)?;
+ 
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "compression.original_ids".to_string(),
+                serde_json::json!(original_ids.iter().map(Uuid::to_string).collect::<Vec<_>>()),
+            );
+            metadata.insert(
+                "compression.algorithm_version".to_string(),
+                serde_json::json!(compression::COMPRESSION_ALGORITHM_VERSION),
+            );
+ 
+            let mut request = StoreRequest::new(&summary_content, MemoryType::Semantic, 0.3)
+                .with_confidence(ConfidenceLevel::Inferred);
+            request.metadata = metadata;
+ 
+            let new_uuid = self.store_with_options_id(request).await?;
+ 
+            if let Err(e) = self.mark_all_superseded(&original_ids, &new_uuid.to_string()) {
+                // Best-effort compensation: try to remove the just-created
+                // summary from both SQLite and the vector store so the
+                // database isn't left with an orphaned, un-superseding
+                // summary. Deletion failures here are not escalated to
+                // CompensationFailed (unlike store/update's compensation
+                // paths) because the *original* error `e` is already the
+                // one that must be returned — we simply do our best to
+                // clean up alongside it.
+                let _ = {
+                    let conn = self.conn.lock().map_err(|_| {
+                        MemoliteError::Internal("database mutex poisoned".into())
+                    });
+                    conn.and_then(|c| {
+                        c.execute(
+                            "DELETE FROM memories WHERE id = ?1",
+                            params![new_uuid.to_string()],
+                        )
+                        .map_err(Into::into)
+                    })
+                };
+                let store = {
+                    let guard = self.vector_store.read().map_err(|_| {
+                        MemoliteError::Internal("vector-store lock poisoned".into())
+                    })?;
+                    Arc::clone(&*guard)
+                };
+                let _ = store.delete(new_uuid).await;
+ 
+                return Err(e);
+            }
+ 
+            compressed_count += members.len();
+        }
+ 
+        Ok(compressed_count)
+    }
+ 
+    /// Marks every id in `old_ids` as `superseded_by` in `new_id`, all in
+    /// one SQLite transaction — mirrors `mark_superseded` (M5), just over
+    /// a batch of ids instead of one.
+    fn mark_all_superseded(&self, old_ids: &[Uuid], new_id: &str) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+        let tx = conn.transaction()?;
+        for old_id in old_ids {
+            tx.execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                params![new_id, old_id.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
  
 fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid, Memory>> {
@@ -960,6 +1142,16 @@ fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>>
         )
     })
 }
+// ---------------------------------------------------------------------
+// Paste everything below directly under the bottom of engine.rs
+// (after the MemoryEngine impl block and any other production code).
+//
+// Contains two sibling test modules:
+//   - `tests`        : core engine tests, with a nested `m7_tests`
+//                       submodule (time-range / staleness / superseded
+//                       chain queries).
+//   - `compression_tests` : memory-compression / consolidation tests.
+// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1980,472 +2172,838 @@ mod tests {
             .unwrap();
         assert_eq!(results.items.len(), 3);
     }
-mod m7_tests {
-    use super::*;
-    use crate::recall::RecallQuery;
- 
-    /// Opens a fresh MemoryEngine backed by a real temp-file SQLite
-    /// database (not `:memory:`, so the on-disk path matches production
-    /// behavior) that is deleted when the returned TempDir drops.
-    async fn test_engine() -> (MemoryEngine, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let db_path = dir.path().join("m7_test.db");
-        let engine = MemoryEngine::open(&db_path)
-            .await
-            .expect("failed to open engine");
-        (engine, dir)
-    }
- 
-    /// Directly rewrites a row's `created_at`/`last_accessed` timestamps.
-    /// Only reachable via raw SQL — there is no public API that lets a
-    /// caller backdate a memory, which is exactly why these tests need
-    /// direct `conn` access and therefore live inside `engine.rs` rather
-    /// than in an external `tests/*.rs` file.
-    fn backdate(engine: &MemoryEngine, id: &str, days_ago: i64) {
-        let conn = engine.conn.lock().unwrap();
-        let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
-        conn.execute(
-            "UPDATE memories SET created_at = ?1, last_accessed = ?1 WHERE id = ?2",
-            params![ts, id],
-        )
-        .unwrap();
-    }
- 
-    fn backdate_last_accessed_only(engine: &MemoryEngine, id: &str, days_ago: i64) {
-        let conn = engine.conn.lock().unwrap();
-        let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
-        conn.execute(
-            "UPDATE memories SET last_accessed = ?1 WHERE id = ?2",
-            params![ts, id],
-        )
-        .unwrap();
-    }
- 
-    // -----------------------------------------------------------------
-    // query_by_time_range
-    // -----------------------------------------------------------------
- 
-    #[tokio::test]
-    async fn query_by_time_range_rejects_start_after_end() {
-        let (engine, _dir) = test_engine().await;
-        let now = Utc::now();
-        let err = engine
-            .query_by_time_range(now, now - chrono::Duration::days(1))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, MemoliteError::InvalidArgument(_)));
-    }
- 
-    #[tokio::test]
-    async fn query_by_time_range_accepts_a_single_instant_window() {
-        let (engine, _dir) = test_engine().await;
-        let now = Utc::now();
-        // start == end must be accepted, not rejected as "inverted".
-        let result = engine.query_by_time_range(now, now).await;
-        assert!(result.is_ok());
-    }
- 
-    #[tokio::test]
-    async fn query_by_time_range_returns_only_the_window_in_order() {
-        let (engine, _dir) = test_engine().await;
-        let id_old = engine
-            .store("old fact about the weather", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        let id_new = engine
-            .store("new fact about the weather", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
- 
-        backdate(&engine, &id_old, 10);
- 
-        let window_start = Utc::now() - chrono::Duration::days(1);
-        let window_end = Utc::now() + chrono::Duration::minutes(1);
-        let results = engine
-            .query_by_time_range(window_start, window_end)
-            .await
-            .unwrap();
- 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id.to_string(), id_new);
-    }
- 
-    #[tokio::test]
-    async fn query_by_time_range_on_empty_engine_returns_empty() {
-        let (engine, _dir) = test_engine().await;
-        let now = Utc::now();
-        let results = engine
-            .query_by_time_range(now - chrono::Duration::days(1), now)
-            .await
-            .unwrap();
-        assert!(results.is_empty());
-    }
- 
-    // -----------------------------------------------------------------
-    // RecallQuery.created_after / .created_before
-    // -----------------------------------------------------------------
- 
-    #[tokio::test]
-    async fn recall_query_rejects_inverted_created_after_before() {
-        let (engine, _dir) = test_engine().await;
-        engine
-            .store("some fact for inversion test", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        let now = Utc::now();
-        let err = engine
-            .recall_query(
-                RecallQuery::new("some fact for inversion test")
-                    .created_after(now)
-                    .created_before(now - chrono::Duration::days(1)),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, MemoliteError::InvalidArgument(_)));
-    }
- 
-    #[tokio::test]
-    async fn recall_query_created_before_excludes_memories_created_after_cutoff() {
-        let (engine, _dir) = test_engine().await;
-        let id_early = engine
-            .store("shared topic alpha marker", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        backdate(&engine, &id_early, 5);
- 
-        let cutoff = Utc::now() - chrono::Duration::days(1);
- 
-        let id_late = engine
-            .store("shared topic alpha marker again", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
- 
-        let results = engine
-            .recall_query(RecallQuery::new("shared topic alpha marker").created_before(cutoff))
-            .await
-            .unwrap();
- 
-        let returned_ids: Vec<String> = results
-            .items
-            .iter()
-            .map(|i| i.memory.id.to_string())
-            .collect();
-        assert!(returned_ids.contains(&id_early));
-        assert!(!returned_ids.contains(&id_late));
-    }
- 
-    #[tokio::test]
-    async fn recall_query_created_after_excludes_memories_created_before_cutoff() {
-        let (engine, _dir) = test_engine().await;
-        let id_early = engine
-            .store("beta marker early fact", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        backdate(&engine, &id_early, 5);
- 
-        let cutoff = Utc::now() - chrono::Duration::days(1);
- 
-        let id_late = engine
-            .store("beta marker late fact", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
- 
-        let results = engine
-            .recall_query(RecallQuery::new("beta marker fact").created_after(cutoff))
-            .await
-            .unwrap();
- 
-        let returned_ids: Vec<String> = results
-            .items
-            .iter()
-            .map(|i| i.memory.id.to_string())
-            .collect();
-        assert!(returned_ids.contains(&id_late));
-        assert!(!returned_ids.contains(&id_early));
-    }
- 
-    // -----------------------------------------------------------------
-    // created_or_accessed_since
-    // -----------------------------------------------------------------
- 
-    #[tokio::test]
-    async fn created_or_accessed_since_finds_a_recently_created_memory() {
-        let (engine, _dir) = test_engine().await;
-        let cutoff = Utc::now() - chrono::Duration::minutes(1);
-        let id = engine
-            .store("freshly created audit fact", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
- 
-        let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
-        assert!(recent.iter().any(|m| m.id.to_string() == id));
-    }
- 
-    #[tokio::test]
-    async fn created_or_accessed_since_catches_a_fresh_recall_of_an_old_memory() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("audit me via recall bump", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        backdate(&engine, &id, 5);
- 
-        let cutoff = Utc::now() - chrono::Duration::hours(1);
- 
-        // recall() bumps last_accessed to "now", which should make this
-        // old memory show up in the "since cutoff" window even though it
-        // was created 5 days ago.
-        engine.recall("audit me via recall bump").await.unwrap();
- 
-        let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
-        assert!(recent.iter().any(|m| m.id.to_string() == id));
-    }
- 
-    #[tokio::test]
-    async fn created_or_accessed_since_excludes_untouched_old_memories() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("never touched again fact", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        backdate(&engine, &id, 5);
- 
-        let cutoff = Utc::now() - chrono::Duration::hours(1);
-        let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
-        assert!(!recent.iter().any(|m| m.id.to_string() == id));
-    }
- 
-    // -----------------------------------------------------------------
-    // find_stale_memories / RecallQuery.only_stale
-    // -----------------------------------------------------------------
- 
-    #[tokio::test]
-    async fn find_stale_memories_respects_the_memory_types_decay_cutoff() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("stale candidate episodic", MemoryType::Episodic, 0.5)
-            .await
-            .unwrap();
- 
-        // Episodic half-life is 14 days -> stale cutoff is 28 days.
-        backdate_last_accessed_only(&engine, &id, 29);
- 
-        let stale = engine.find_stale_memories().await.unwrap();
-        assert!(stale.iter().any(|m| m.id.to_string() == id));
-    }
- 
-    #[tokio::test]
-    async fn find_stale_memories_excludes_recently_accessed_memories() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("fresh episodic memory", MemoryType::Episodic, 0.5)
-            .await
-            .unwrap();
-        // Well under the 28-day episodic staleness cutoff.
-        backdate_last_accessed_only(&engine, &id, 1);
- 
-        let stale = engine.find_stale_memories().await.unwrap();
-        assert!(!stale.iter().any(|m| m.id.to_string() == id));
-    }
- 
-    #[tokio::test]
-    async fn find_stale_memories_excludes_superseded_memories() {
-        let (engine, _dir) = test_engine().await;
-        let id_a = engine
-            .store("superseded stale candidate", MemoryType::Episodic, 0.5)
-            .await
-            .unwrap();
-        backdate_last_accessed_only(&engine, &id_a, 29);
- 
-        let _id_b = engine
-            .update(
-                &id_a,
-                MemoryUpdate {
-                    new_content: Some("replacement content".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
- 
-        let stale = engine.find_stale_memories().await.unwrap();
-        // id_a is now superseded, so it must not appear even though it
-        // would otherwise pass the staleness cutoff.
-        assert!(!stale.iter().any(|m| m.id.to_string() == id_a));
-    }
- 
-    #[tokio::test]
-    async fn only_stale_filter_agrees_with_find_stale_memories() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("only stale filter marker fact", MemoryType::Episodic, 0.5)
-            .await
-            .unwrap();
-        backdate_last_accessed_only(&engine, &id, 29);
- 
-        // find_stale_memories() must run FIRST: recall_query() bumps
-        // access_count/last_accessed on every item it returns, regardless
-        // of which filter let that item through. Calling recall_query()
-        // first would reset last_accessed to "now" as a side effect of
-        // successfully recalling the stale memory, un-staling it before
-        // find_stale_memories() gets a chance to observe it. That bump is
-        // correct production behavior (an access is an access) -- it's
-        // this test's ordering that has to respect it.
-        let via_find_stale = engine.find_stale_memories().await.unwrap();
-        assert!(via_find_stale.iter().any(|m| m.id.to_string() == id));
- 
-        let via_recall = engine
-            .recall_query(RecallQuery::new("only stale filter marker fact").only_stale(true))
-            .await
-            .unwrap();
-        assert!(via_recall.items.iter().any(|i| i.memory.id.to_string() == id));
-    }
- 
-    #[tokio::test]
-    async fn only_stale_false_by_default_includes_fresh_memories() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("default recall includes fresh fact", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
- 
-        let results = engine
-            .recall("default recall includes fresh fact")
-            .await
-            .unwrap();
-        assert!(results.iter().any(|m| m.id.to_string() == id));
-    }
- 
-    // -----------------------------------------------------------------
-    // find_superseded_chain
-    // -----------------------------------------------------------------
- 
-    #[tokio::test]
-    async fn find_superseded_chain_walks_three_generations() {
-        let (engine, _dir) = test_engine().await;
-        let id_a = engine
-            .store("chain v1", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        let id_b = engine
-            .update(
-                &id_a,
-                MemoryUpdate {
-                    new_content: Some("chain v2".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let id_c = engine
-            .update(
-                &id_b,
-                MemoryUpdate {
-                    new_content: Some("chain v3".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
- 
-        let chain = engine.find_superseded_chain(&id_a).await.unwrap();
-        let ids: Vec<String> = chain.iter().map(|m| m.id.to_string()).collect();
-        assert_eq!(ids, vec![id_a, id_b, id_c]);
-    }
- 
-    #[tokio::test]
-    async fn find_superseded_chain_from_a_middle_link_returns_only_the_remaining_tail() {
-        let (engine, _dir) = test_engine().await;
-        let id_a = engine
-            .store("mid-chain v1", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
-        let id_b = engine
-            .update(
-                &id_a,
-                MemoryUpdate {
-                    new_content: Some("mid-chain v2".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let id_c = engine
-            .update(
-                &id_b,
-                MemoryUpdate {
-                    new_content: Some("mid-chain v3".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
- 
-        // Starting from the middle link should NOT include id_a.
-        let chain = engine.find_superseded_chain(&id_b).await.unwrap();
-        let ids: Vec<String> = chain.iter().map(|m| m.id.to_string()).collect();
-        assert_eq!(ids, vec![id_b, id_c]);
-    }
- 
-    #[tokio::test]
-    async fn find_superseded_chain_on_a_never_updated_memory_is_a_single_element_chain() {
-        let (engine, _dir) = test_engine().await;
-        let id = engine
-            .store("never updated", MemoryType::Semantic, 0.5)
-            .await
-            .unwrap();
- 
-        let chain = engine.find_superseded_chain(&id).await.unwrap();
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].id.to_string(), id);
-    }
- 
-    #[tokio::test]
-    async fn find_superseded_chain_on_a_nonexistent_id_is_not_found() {
-        let (engine, _dir) = test_engine().await;
-        let random_id = Uuid::new_v4().to_string();
-        let err = engine.find_superseded_chain(&random_id).await.unwrap_err();
-        assert!(matches!(err, MemoliteError::NotFound(_)));
-    }
- 
-    #[tokio::test]
-    async fn find_superseded_chain_on_a_malformed_id_is_invalid_uuid() {
-        let (engine, _dir) = test_engine().await;
-        let err = engine
-            .find_superseded_chain("not-a-uuid")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, MemoliteError::InvalidUuid(_)));
-    }
- 
-    #[tokio::test]
-    async fn find_superseded_chain_trips_the_cycle_guard_on_corrupted_data() {
-        let (engine, _dir) = test_engine().await;
-        let id_a = engine.store("cycle a", MemoryType::Semantic, 0.5).await.unwrap();
-        let id_b = engine.store("cycle b", MemoryType::Semantic, 0.5).await.unwrap();
- 
-        // Hand-craft a cycle: a -> b -> a. Only reachable via raw SQL,
-        // since the public update() API can never produce this shape.
-        {
+
+    // -------------------------------------------------------------
+    // m7: time-range queries, staleness, and superseded-chain walks
+    // -------------------------------------------------------------
+    mod m7_tests {
+        use super::*;
+        use crate::recall::RecallQuery;
+
+        /// Opens a fresh MemoryEngine backed by a real temp-file SQLite
+        /// database (not `:memory:`, so the on-disk path matches production
+        /// behavior) that is deleted when the returned TempDir drops.
+        async fn test_engine() -> (MemoryEngine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("failed to create temp dir");
+            let db_path = dir.path().join("m7_test.db");
+            let engine = MemoryEngine::open(&db_path)
+                .await
+                .expect("failed to open engine");
+            (engine, dir)
+        }
+
+        /// Directly rewrites a row's `created_at`/`last_accessed` timestamps.
+        /// Only reachable via raw SQL -- there is no public API that lets a
+        /// caller backdate a memory, which is exactly why these tests need
+        /// direct `conn` access and therefore live inside `engine.rs` rather
+        /// than in an external `tests/*.rs` file.
+        fn backdate(engine: &MemoryEngine, id: &str, days_ago: i64) {
             let conn = engine.conn.lock().unwrap();
+            let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
             conn.execute(
-                "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
-                params![id_b, id_a],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
-                params![id_a, id_b],
+                "UPDATE memories SET created_at = ?1, last_accessed = ?1 WHERE id = ?2",
+                params![ts, id],
             )
             .unwrap();
         }
- 
-        let err = engine.find_superseded_chain(&id_a).await.unwrap_err();
-        assert!(matches!(err, MemoliteError::Internal(_)));
+
+        fn backdate_last_accessed_only(engine: &MemoryEngine, id: &str, days_ago: i64) {
+            let conn = engine.conn.lock().unwrap();
+            let ts = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
+            conn.execute(
+                "UPDATE memories SET last_accessed = ?1 WHERE id = ?2",
+                params![ts, id],
+            )
+            .unwrap();
+        }
+
+        // -----------------------------------------------------------------
+        // query_by_time_range
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn query_by_time_range_rejects_start_after_end() {
+            let (engine, _dir) = test_engine().await;
+            let now = Utc::now();
+            let err = engine
+                .query_by_time_range(now, now - chrono::Duration::days(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MemoliteError::InvalidArgument(_)));
+        }
+
+        #[tokio::test]
+        async fn query_by_time_range_accepts_a_single_instant_window() {
+            let (engine, _dir) = test_engine().await;
+            let now = Utc::now();
+            // start == end must be accepted, not rejected as "inverted".
+            let result = engine.query_by_time_range(now, now).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn query_by_time_range_returns_only_the_window_in_order() {
+            let (engine, _dir) = test_engine().await;
+            let id_old = engine
+                .store("old fact about the weather", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            let id_new = engine
+                .store("new fact about the weather", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+
+            backdate(&engine, &id_old, 10);
+
+            let window_start = Utc::now() - chrono::Duration::days(1);
+            let window_end = Utc::now() + chrono::Duration::minutes(1);
+            let results = engine
+                .query_by_time_range(window_start, window_end)
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id.to_string(), id_new);
+        }
+
+        #[tokio::test]
+        async fn query_by_time_range_on_empty_engine_returns_empty() {
+            let (engine, _dir) = test_engine().await;
+            let now = Utc::now();
+            let results = engine
+                .query_by_time_range(now - chrono::Duration::days(1), now)
+                .await
+                .unwrap();
+            assert!(results.is_empty());
+        }
+
+        // -----------------------------------------------------------------
+        // RecallQuery.created_after / .created_before
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn recall_query_rejects_inverted_created_after_before() {
+            let (engine, _dir) = test_engine().await;
+            engine
+                .store("some fact for inversion test", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            let now = Utc::now();
+            let err = engine
+                .recall_query(
+                    RecallQuery::new("some fact for inversion test")
+                        .created_after(now)
+                        .created_before(now - chrono::Duration::days(1)),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MemoliteError::InvalidArgument(_)));
+        }
+
+        #[tokio::test]
+        async fn recall_query_created_before_excludes_memories_created_after_cutoff() {
+            let (engine, _dir) = test_engine().await;
+            let id_early = engine
+                .store("shared topic alpha marker", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            backdate(&engine, &id_early, 5);
+
+            let cutoff = Utc::now() - chrono::Duration::days(1);
+
+            let id_late = engine
+                .store("shared topic alpha marker again", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+
+            let results = engine
+                .recall_query(RecallQuery::new("shared topic alpha marker").created_before(cutoff))
+                .await
+                .unwrap();
+
+            let returned_ids: Vec<String> = results
+                .items
+                .iter()
+                .map(|i| i.memory.id.to_string())
+                .collect();
+            assert!(returned_ids.contains(&id_early));
+            assert!(!returned_ids.contains(&id_late));
+        }
+
+        #[tokio::test]
+        async fn recall_query_created_after_excludes_memories_created_before_cutoff() {
+            let (engine, _dir) = test_engine().await;
+            let id_early = engine
+                .store("beta marker early fact", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            backdate(&engine, &id_early, 5);
+
+            let cutoff = Utc::now() - chrono::Duration::days(1);
+
+            let id_late = engine
+                .store("beta marker late fact", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+
+            let results = engine
+                .recall_query(RecallQuery::new("beta marker fact").created_after(cutoff))
+                .await
+                .unwrap();
+
+            let returned_ids: Vec<String> = results
+                .items
+                .iter()
+                .map(|i| i.memory.id.to_string())
+                .collect();
+            assert!(returned_ids.contains(&id_late));
+            assert!(!returned_ids.contains(&id_early));
+        }
+
+        // -----------------------------------------------------------------
+        // created_or_accessed_since
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn created_or_accessed_since_finds_a_recently_created_memory() {
+            let (engine, _dir) = test_engine().await;
+            let cutoff = Utc::now() - chrono::Duration::minutes(1);
+            let id = engine
+                .store("freshly created audit fact", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+
+            let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
+            assert!(recent.iter().any(|m| m.id.to_string() == id));
+        }
+
+        #[tokio::test]
+        async fn created_or_accessed_since_catches_a_fresh_recall_of_an_old_memory() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("audit me via recall bump", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            backdate(&engine, &id, 5);
+
+            let cutoff = Utc::now() - chrono::Duration::hours(1);
+
+            // recall() bumps last_accessed to "now", which should make this
+            // old memory show up in the "since cutoff" window even though it
+            // was created 5 days ago.
+            engine.recall("audit me via recall bump").await.unwrap();
+
+            let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
+            assert!(recent.iter().any(|m| m.id.to_string() == id));
+        }
+
+        #[tokio::test]
+        async fn created_or_accessed_since_excludes_untouched_old_memories() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("never touched again fact", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            backdate(&engine, &id, 5);
+
+            let cutoff = Utc::now() - chrono::Duration::hours(1);
+            let recent = engine.created_or_accessed_since(cutoff).await.unwrap();
+            assert!(!recent.iter().any(|m| m.id.to_string() == id));
+        }
+
+        // -----------------------------------------------------------------
+        // find_stale_memories / RecallQuery.only_stale
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn find_stale_memories_respects_the_memory_types_decay_cutoff() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("stale candidate episodic", MemoryType::Episodic, 0.5)
+                .await
+                .unwrap();
+
+            // Episodic half-life is 14 days -> stale cutoff is 28 days.
+            backdate_last_accessed_only(&engine, &id, 29);
+
+            let stale = engine.find_stale_memories().await.unwrap();
+            assert!(stale.iter().any(|m| m.id.to_string() == id));
+        }
+
+        #[tokio::test]
+        async fn find_stale_memories_excludes_recently_accessed_memories() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("fresh episodic memory", MemoryType::Episodic, 0.5)
+                .await
+                .unwrap();
+            // Well under the 28-day episodic staleness cutoff.
+            backdate_last_accessed_only(&engine, &id, 1);
+
+            let stale = engine.find_stale_memories().await.unwrap();
+            assert!(!stale.iter().any(|m| m.id.to_string() == id));
+        }
+
+        #[tokio::test]
+        async fn find_stale_memories_excludes_superseded_memories() {
+            let (engine, _dir) = test_engine().await;
+            let id_a = engine
+                .store("superseded stale candidate", MemoryType::Episodic, 0.5)
+                .await
+                .unwrap();
+            backdate_last_accessed_only(&engine, &id_a, 29);
+
+            let _id_b = engine
+                .update(
+                    &id_a,
+                    MemoryUpdate {
+                        new_content: Some("replacement content".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            let stale = engine.find_stale_memories().await.unwrap();
+            // id_a is now superseded, so it must not appear even though it
+            // would otherwise pass the staleness cutoff.
+            assert!(!stale.iter().any(|m| m.id.to_string() == id_a));
+        }
+
+        #[tokio::test]
+        async fn only_stale_filter_agrees_with_find_stale_memories() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("only stale filter marker fact", MemoryType::Episodic, 0.5)
+                .await
+                .unwrap();
+            backdate_last_accessed_only(&engine, &id, 29);
+
+            // find_stale_memories() must run FIRST: recall_query() bumps
+            // access_count/last_accessed on every item it returns, regardless
+            // of which filter let that item through. Calling recall_query()
+            // first would reset last_accessed to "now" as a side effect of
+            // successfully recalling the stale memory, un-staling it before
+            // find_stale_memories() gets a chance to observe it. That bump is
+            // correct production behavior (an access is an access) -- it's
+            // this test's ordering that has to respect it.
+            let via_find_stale = engine.find_stale_memories().await.unwrap();
+            assert!(via_find_stale.iter().any(|m| m.id.to_string() == id));
+
+            let via_recall = engine
+                .recall_query(RecallQuery::new("only stale filter marker fact").only_stale(true))
+                .await
+                .unwrap();
+            assert!(via_recall.items.iter().any(|i| i.memory.id.to_string() == id));
+        }
+
+        #[tokio::test]
+        async fn only_stale_false_by_default_includes_fresh_memories() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("default recall includes fresh fact", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+
+            let results = engine
+                .recall("default recall includes fresh fact")
+                .await
+                .unwrap();
+            assert!(results.iter().any(|m| m.id.to_string() == id));
+        }
+
+        // -----------------------------------------------------------------
+        // find_superseded_chain
+        // -----------------------------------------------------------------
+
+        #[tokio::test]
+        async fn find_superseded_chain_walks_three_generations() {
+            let (engine, _dir) = test_engine().await;
+            let id_a = engine
+                .store("chain v1", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            let id_b = engine
+                .update(
+                    &id_a,
+                    MemoryUpdate {
+                        new_content: Some("chain v2".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let id_c = engine
+                .update(
+                    &id_b,
+                    MemoryUpdate {
+                        new_content: Some("chain v3".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            let chain = engine.find_superseded_chain(&id_a).await.unwrap();
+            let ids: Vec<String> = chain.iter().map(|m| m.id.to_string()).collect();
+            assert_eq!(ids, vec![id_a, id_b, id_c]);
+        }
+
+        #[tokio::test]
+        async fn find_superseded_chain_from_a_middle_link_returns_only_the_remaining_tail() {
+            let (engine, _dir) = test_engine().await;
+            let id_a = engine
+                .store("mid-chain v1", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+            let id_b = engine
+                .update(
+                    &id_a,
+                    MemoryUpdate {
+                        new_content: Some("mid-chain v2".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let id_c = engine
+                .update(
+                    &id_b,
+                    MemoryUpdate {
+                        new_content: Some("mid-chain v3".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            // Starting from the middle link should NOT include id_a.
+            let chain = engine.find_superseded_chain(&id_b).await.unwrap();
+            let ids: Vec<String> = chain.iter().map(|m| m.id.to_string()).collect();
+            assert_eq!(ids, vec![id_b, id_c]);
+        }
+
+        #[tokio::test]
+        async fn find_superseded_chain_on_a_never_updated_memory_is_a_single_element_chain() {
+            let (engine, _dir) = test_engine().await;
+            let id = engine
+                .store("never updated", MemoryType::Semantic, 0.5)
+                .await
+                .unwrap();
+
+            let chain = engine.find_superseded_chain(&id).await.unwrap();
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].id.to_string(), id);
+        }
+
+        #[tokio::test]
+        async fn find_superseded_chain_on_a_nonexistent_id_is_not_found() {
+            let (engine, _dir) = test_engine().await;
+            let random_id = Uuid::new_v4().to_string();
+            let err = engine.find_superseded_chain(&random_id).await.unwrap_err();
+            assert!(matches!(err, MemoliteError::NotFound(_)));
+        }
+
+        #[tokio::test]
+        async fn find_superseded_chain_on_a_malformed_id_is_invalid_uuid() {
+            let (engine, _dir) = test_engine().await;
+            let err = engine
+                .find_superseded_chain("not-a-uuid")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MemoliteError::InvalidUuid(_)));
+        }
+
+        #[tokio::test]
+        async fn find_superseded_chain_trips_the_cycle_guard_on_corrupted_data() {
+            let (engine, _dir) = test_engine().await;
+            let id_a = engine.store("cycle a", MemoryType::Semantic, 0.5).await.unwrap();
+            let id_b = engine.store("cycle b", MemoryType::Semantic, 0.5).await.unwrap();
+
+            // Hand-craft a cycle: a -> b -> a. Only reachable via raw SQL,
+            // since the public update() API can never produce this shape.
+            {
+                let conn = engine.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                    params![id_b, id_a],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
+                    params![id_a, id_b],
+                )
+                .unwrap();
+            }
+
+            let err = engine.find_superseded_chain(&id_a).await.unwrap_err();
+            assert!(matches!(err, MemoliteError::Internal(_)));
+        }
     }
 }
 
+// ---------------------------------------------------------------------
+// Memory compression / consolidation tests
+// ---------------------------------------------------------------------
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use crate::recall::RecallQuery;
 
+    /// Directly rewrites a memory's `created_at` column via the engine's
+    /// own connection -- the private-field equivalent of what the
+    /// black-box integration tests do through a second `Connection` to
+    /// an on-disk file (not possible here since `:memory:` databases
+    /// can't be shared across connections).
+    fn backdate(engine: &MemoryEngine, id: &str, days_ago: i64) {
+        let conn = engine.conn.lock().expect("database mutex poisoned");
+        let cutoff = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE id = ?2",
+            params![cutoff, id],
+        )
+        .expect("backdate created_at");
+    }
 
-    
+    /// Inserts a `memories` row with no matching `embeddings` row,
+    /// directly via the engine's connection -- simulates the corruption
+    /// case `compress_old_memories` must fail loudly on.
+    fn insert_orphan_episodic_row(engine: &MemoryEngine, importance: f32, days_ago: i64) -> Uuid {
+        let conn = engine.conn.lock().expect("database mutex poisoned");
+        let id = Uuid::new_v4();
+        let created_at = (Utc::now() - chrono::Duration::days(days_ago)).timestamp();
+        conn.execute(
+            r#"
+            INSERT INTO memories (
+                id, content, type, importance, access_count,
+                created_at, last_accessed, expires_at, superseded_by, metadata, confidence
+            )
+            VALUES (?1, 'orphan with no embedding', 'episodic', ?2, 0, ?3, ?3, NULL, NULL, '{}', 'explicit')
+            "#,
+            params![id.to_string(), importance, created_at],
+        )
+        .expect("insert orphan memory row");
+        id
+    }
+
+    #[tokio::test]
+    async fn compress_old_memories_folds_similar_old_episodic_memories_into_one_summary() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        let id_a = engine
+            .store(
+                "The user debugged a login timeout issue in the auth service",
+                MemoryType::Episodic,
+                0.2,
+            )
+            .await
+            .unwrap();
+        let id_b = engine
+            .store(
+                "The user debugged a login timeout problem in the auth service",
+                MemoryType::Episodic,
+                0.2,
+            )
+            .await
+            .unwrap();
+        let id_c = engine
+            .store(
+                "The user debugged a login timeout bug in the auth service",
+                MemoryType::Episodic,
+                0.2,
+            )
+            .await
+            .unwrap();
+        let id_important = engine
+            .store(
+                "The production database credentials rotated successfully",
+                MemoryType::Episodic,
+                0.9,
+            )
+            .await
+            .unwrap();
+
+        for id in [&id_a, &id_b, &id_c] {
+            backdate(&engine, id, 20);
+        }
+
+        let compressed = engine.compress_old_memories().await.unwrap();
+        assert_eq!(compressed, 3);
+
+        for id in [&id_a, &id_b, &id_c] {
+            let mem = engine.get(id).await.unwrap().expect("original still present");
+            assert!(mem.superseded_by.is_some());
+        }
+
+        let important = engine.get(&id_important).await.unwrap().unwrap();
+        assert!(important.superseded_by.is_none());
+
+        let summary_id = engine.get(&id_a).await.unwrap().unwrap().superseded_by.unwrap();
+        let summary = engine
+            .get(&summary_id.to_string())
+            .await
+            .unwrap()
+            .expect("summary should exist");
+        assert_eq!(summary.memory_type, MemoryType::Semantic);
+        assert_eq!(summary.confidence, ConfidenceLevel::Inferred);
+
+        let original_ids_value = summary
+            .metadata
+            .get("compression.original_ids")
+            .expect("summary metadata should record original ids");
+        let original_ids: Vec<String> = serde_json::from_value(original_ids_value.clone()).unwrap();
+        let original_ids: std::collections::HashSet<_> = original_ids.into_iter().collect();
+        assert!(original_ids.contains(&id_a));
+        assert!(original_ids.contains(&id_b));
+        assert!(original_ids.contains(&id_c));
+    }
+
+    #[tokio::test]
+    async fn compress_old_memories_ignores_high_importance_memories() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        let id = engine
+            .store("An important old memory", MemoryType::Episodic, 0.9)
+            .await
+            .unwrap();
+        backdate(&engine, &id, 20);
+
+        let compressed = engine.compress_old_memories().await.unwrap();
+        assert_eq!(compressed, 0);
+
+        let mem = engine.get(&id).await.unwrap().unwrap();
+        assert!(mem.superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn compress_old_memories_ignores_young_memories() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        // Not backdated -- still fresh, so should never be picked up by
+        // get_episodic_memories_older_than(14) at all.
+        let id = engine
+            .store("A brand new low-importance episodic memory", MemoryType::Episodic, 0.1)
+            .await
+            .unwrap();
+
+        let compressed = engine.compress_old_memories().await.unwrap();
+        assert_eq!(compressed, 0);
+
+        let mem = engine.get(&id).await.unwrap().unwrap();
+        assert!(mem.superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn compress_old_memories_leaves_clusters_smaller_than_three_uncompressed() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        let id_a = engine
+            .store("A rare old episodic memory about the weather", MemoryType::Episodic, 0.1)
+            .await
+            .unwrap();
+        let id_b = engine
+            .store("A rare old episodic memory about the weather today", MemoryType::Episodic, 0.1)
+            .await
+            .unwrap();
+
+        backdate(&engine, &id_a, 20);
+        backdate(&engine, &id_b, 20);
+
+        let compressed = engine.compress_old_memories().await.unwrap();
+        assert_eq!(compressed, 0, "a 2-member cluster is below the >=3 threshold");
+
+        assert!(engine.get(&id_a).await.unwrap().unwrap().superseded_by.is_none());
+        assert!(engine.get(&id_b).await.unwrap().unwrap().superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn compress_old_memories_reports_missing_embedding_as_corruption() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        // A healthy candidate so the candidate set isn't empty.
+        let healthy_id = engine
+            .store("A perfectly normal old episodic memory", MemoryType::Episodic, 0.1)
+            .await
+            .unwrap();
+        backdate(&engine, &healthy_id, 20);
+
+        // A corrupt row: present in `memories`, absent from `embeddings`.
+        let orphan_id = insert_orphan_episodic_row(&engine, 0.1, 20);
+
+        let result = engine.compress_old_memories().await;
+        let err = result.expect_err("a missing embedding must surface as an error, not be skipped");
+        assert!(matches!(err, MemoliteError::Corruption(_)));
+        let orphan_id_str = orphan_id.to_string();
+        assert!(
+            err.to_string().contains(orphan_id_str.as_str()),
+            "error should name the specific memory id with no embedding: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compress_old_memories_on_empty_database_returns_zero() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+        let compressed = engine.compress_old_memories().await.unwrap();
+        assert_eq!(compressed, 0);
+    }
+#[tokio::test]
+async fn rebuild_vector_index_prunes_superseded_originals_but_keeps_summary_searchable() {
+    let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+    // Near-templated sentences (identical structure, a single word
+    // swapped) -- mirrors the login-timeout fixture in
+    // `compress_old_memories_folds_similar_old_episodic_memories_into_one_summary`,
+    // which is the pattern that reliably clears the 0.85 cosine
+    // threshold under a real sentence-embedding model. Looser
+    // paraphrases ("prefers dark mode" / "likes dark themes" /
+    // "prefers a dark color theme") are semantically equivalent to a
+    // person but routinely land in the 0.6-0.84 range with common
+    // small embedding models, which is below the clustering
+    // threshold and would make this test flaky depending on which
+    // embedder backs `Embedder::embed`.
+    let id_a = engine
+        .store(
+            "The user prefers dark mode across all their applications",
+            MemoryType::Episodic,
+            0.2,
+        )
+        .await
+        .unwrap();
+    let id_b = engine
+        .store(
+            "The user prefers dark mode across all their apps",
+            MemoryType::Episodic,
+            0.2,
+        )
+        .await
+        .unwrap();
+    let id_c = engine
+        .store(
+            "The user prefers dark mode across every application",
+            MemoryType::Episodic,
+            0.2,
+        )
+        .await
+        .unwrap();
+
+    for id in [&id_a, &id_b, &id_c] {
+        backdate(&engine, id, 20);
+    }
+
+    assert_eq!(engine.compress_old_memories().await.unwrap(), 3);
+
+    let summary_id = engine.get(&id_a).await.unwrap().unwrap().superseded_by.unwrap();
+
+    // Before rebuild: compress_old_memories() never touched the
+    // vector store's entries for the originals (it only inserted the
+    // new summary vector and flipped `superseded_by` in SQLite), so
+    // the stale in-memory index still has all four vectors. A
+    // superseded-inclusive recall finds all of them.
+    let before = engine
+        .recall_query(
+            RecallQuery::new("dark mode preference across applications")
+                .limit(20)
+                .include_superseded(true),
+        )
+        .await
+        .unwrap();
+    let before_ids: std::collections::HashSet<String> =
+        before.items.iter().map(|i| i.memory.id.to_string()).collect();
+    assert!(before_ids.contains(&id_a));
+    assert!(before_ids.contains(&id_b));
+    assert!(before_ids.contains(&id_c));
+    assert!(before_ids.contains(&summary_id.to_string()));
+
+    // rebuild_vector_index() runs `reconcile_vector_index` with
+    // `BackfillPolicy::ReplaceAll`, whose query is
+    // `WHERE superseded_by IS NULL AND (expires_at IS NULL OR
+    // expires_at > now)` -- this intentionally excludes superseded
+    // (and expired) memories from the rebuilt index, matching what
+    // `open()`, `forget()`'s compensation path, and
+    // `purge_expired()`'s compensation path already do. So after a
+    // rebuild, the three now-superseded originals are no longer
+    // *vector-searchable*, even though nothing was deleted from
+    // SQLite.
+    engine.rebuild_vector_index().await.unwrap();
+
+    let after = engine
+        .recall_query(
+            RecallQuery::new("dark mode preference across applications")
+                .limit(20)
+                .include_superseded(true),
+        )
+        .await
+        .unwrap();
+    let after_ids: std::collections::HashSet<String> =
+        after.items.iter().map(|i| i.memory.id.to_string()).collect();
+
+    assert!(
+        after_ids.contains(&summary_id.to_string()),
+        "the active summary must remain searchable after a rebuild"
+    );
+    assert!(
+        !after_ids.contains(&id_a) && !after_ids.contains(&id_b) && !after_ids.contains(&id_c),
+        "superseded originals are expected to drop out of the rebuilt ANN index"
+    );
+
+    // The originals' data is still fully intact in SQLite -- rebuild
+    // only affects what's searchable via the vector index, never
+    // what `get()`/`find_superseded_chain()` can retrieve directly.
+    for id in [&id_a, &id_b, &id_c] {
+        let mem = engine.get(id).await.unwrap().expect("original must still exist in SQLite");
+        assert_eq!(mem.superseded_by, Some(summary_id));
+    }
+}
+    #[tokio::test]
+    async fn get_episodic_memories_older_than_only_returns_old_episodic_rows() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        let old_episodic = engine
+            .store("old episodic", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        backdate(&engine, &old_episodic, 20);
+
+        let young_episodic = engine
+            .store("young episodic", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        // left un-backdated: created "now", should not appear.
+
+        let old_semantic = engine
+            .store("old semantic", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        backdate(&engine, &old_semantic, 20);
+
+        let rows = engine.get_episodic_memories_older_than(14).unwrap();
+        let ids: std::collections::HashSet<String> =
+            rows.iter().map(|m| m.id.to_string()).collect();
+
+        assert!(ids.contains(&old_episodic));
+        assert!(!ids.contains(&young_episodic));
+        assert!(!ids.contains(&old_semantic));
+    }
+
+    #[tokio::test]
+    async fn mark_all_superseded_updates_every_id_in_one_transaction() {
+        let engine = MemoryEngine::open(":memory:").await.unwrap();
+
+        let id_a = engine.store("a", MemoryType::Episodic, 0.5).await.unwrap();
+        let id_b = engine.store("b", MemoryType::Episodic, 0.5).await.unwrap();
+        let id_c = engine.store("c", MemoryType::Episodic, 0.5).await.unwrap();
+        let new_id = engine.store("summary", MemoryType::Semantic, 0.5).await.unwrap();
+
+        let old_ids: Vec<Uuid> = [&id_a, &id_b, &id_c]
+            .iter()
+            .map(|s| Uuid::parse_str(s.as_str()).unwrap())
+            .collect();
+
+        engine.mark_all_superseded(&old_ids, &new_id).unwrap();
+
+        for id in [&id_a, &id_b, &id_c] {
+            let mem = engine.get(id).await.unwrap().unwrap();
+            assert_eq!(mem.superseded_by.unwrap().to_string(), new_id);
+        }
+    }
 }
