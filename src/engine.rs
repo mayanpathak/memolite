@@ -1,31 +1,34 @@
-
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
- 
+
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
- 
+
 use crate::compression::{self, CompressionResult};
 use crate::confidence::ConfidenceLevel;
 use crate::embedder::Embedder;
 use crate::error::{MemoliteError, Result};
+use crate::maintenance::{
+    build_intervals, spawn_maintenance_task, validate_config, MaintenanceConfig,
+    MaintenanceHandle,
+};
 use crate::memory::{Memory, MemoryType};
 use crate::requests::{ExpiryPolicy, MemoryUpdate, StoreRequest};
 use crate::vector_store::{validate_vector, InMemoryVectorStore, VectorEntry, VectorStore};
- 
+
 const MEMORY_COLUMNS: &str = "id, content, type, importance, access_count, \
     created_at, last_accessed, expires_at, superseded_by, metadata, confidence";
- 
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackfillPolicy {
     ExistingOnly,
     UpsertLocal,
     ReplaceAll,
 }
- 
+
 pub struct MemoryEngine {
     conn: Mutex<Connection>,
     embedder: Mutex<Embedder>,
@@ -33,12 +36,12 @@ pub struct MemoryEngine {
     #[allow(dead_code)]
     maintenance_running: Arc<AtomicBool>,
 }
- 
+
 impl MemoryEngine {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_store_internal(path, None, BackfillPolicy::ReplaceAll).await
     }
- 
+
     pub(crate) async fn open_with_store_internal(
         path: impl AsRef<Path>,
         store_override: Option<Arc<dyn VectorStore>>,
@@ -46,10 +49,10 @@ impl MemoryEngine {
     ) -> Result<Self> {
         let mut raw_conn = Connection::open(path)?;
         crate::migrations::run_migrations(&mut raw_conn)?;
- 
+
         let embedder = Embedder::new()?;
         let dim = embedder.dimension();
- 
+
         let vector_store: Arc<dyn VectorStore> = match store_override {
             Some(store) => {
                 if store.dimension() != dim {
@@ -63,10 +66,10 @@ impl MemoryEngine {
             }
             None => Arc::new(InMemoryVectorStore::new(dim)),
         };
- 
+
         let conn = Mutex::new(raw_conn);
         reconcile_vector_index(&conn, &vector_store, backfill).await?;
- 
+
         Ok(Self {
             conn,
             embedder: Mutex::new(embedder),
@@ -74,7 +77,7 @@ impl MemoryEngine {
             maintenance_running: Arc::new(AtomicBool::new(false)),
         })
     }
- 
+
     pub async fn store(
         &self,
         content: &str,
@@ -84,13 +87,13 @@ impl MemoryEngine {
         self.store_with_options(StoreRequest::new(content, memory_type, importance))
             .await
     }
- 
+
     pub async fn store_with_options(&self, request: StoreRequest) -> Result<String> {
         self.store_with_options_id(request)
             .await
             .map(|id| id.to_string())
     }
- 
+
     async fn store_with_options_id(&self, request: StoreRequest) -> Result<Uuid> {
         if request.content.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
@@ -109,7 +112,7 @@ impl MemoryEngine {
                 ));
             }
         }
- 
+
         let id = Uuid::new_v4();
         let id_str = id.to_string();
         let created_at = Utc::now();
@@ -119,7 +122,7 @@ impl MemoryEngine {
             ExpiryPolicy::TypeDefault => Some(created_at + request.memory_type.default_ttl()),
         };
         let metadata_json = serde_json::to_string(&request.metadata)?;
- 
+
         let vector = {
             let mut embedder = self
                 .embedder
@@ -130,13 +133,13 @@ impl MemoryEngine {
         let dimension = vector.len();
         let encoded_vector = bincode::serialize(&vector)
             .map_err(|e| MemoliteError::EmbeddingEncode(e.to_string()))?;
- 
+
         {
             let mut conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
- 
+
             let tx = conn.transaction()?;
             tx.execute(
                 r#"
@@ -163,7 +166,7 @@ impl MemoryEngine {
             )?;
             tx.commit()?;
         }
- 
+
         let store = {
             let guard = self
                 .vector_store
@@ -171,7 +174,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
- 
+
         if let Err(e) = store.insert(id, &vector, request.metadata.clone()).await {
             let compensation = {
                 let conn = self
@@ -192,23 +195,23 @@ impl MemoryEngine {
             }
             return Err(e);
         }
- 
+
         Ok(id)
     }
- 
+
     pub async fn recall(&self, query: &str) -> Result<Vec<Memory>> {
         let result = self
             .recall_query(crate::recall::RecallQuery::new(query))
             .await?;
         Ok(result.items.into_iter().map(|i| i.memory).collect())
     }
- 
+
     pub async fn recall_query(
         &self,
         query: crate::recall::RecallQuery,
     ) -> Result<crate::recall::RecallResult> {
         use crate::recall::{RecallItem, RecallResult};
- 
+
         if query.query_text.trim().is_empty() {
             return Err(MemoliteError::InvalidArgument(
                 "query_text must not be empty".into(),
@@ -233,7 +236,7 @@ impl MemoryEngine {
                 ));
             }
         }
- 
+
         let query_vector = {
             let mut embedder = self
                 .embedder
@@ -241,7 +244,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("embedder mutex poisoned".into()))?;
             embedder.embed(&query.query_text)?
         };
- 
+
         let store = {
             let guard = self
                 .vector_store
@@ -249,17 +252,17 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
- 
+
         let pool_size = crate::recall::candidate_pool_size(query.limit);
         let hits = store.search(&query_vector, pool_size).await?;
- 
+
         if hits.is_empty() {
             return Ok(RecallResult { items: Vec::new() });
         }
- 
+
         let hit_ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
         let now = Utc::now();
- 
+
         let by_id = {
             let conn = self
                 .conn
@@ -267,13 +270,13 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             fetch_memories_by_ids(&conn, &hit_ids)?
         };
- 
+
         let mut scored: Vec<RecallItem> = Vec::with_capacity(hits.len());
         for hit in &hits {
             let Some(memory) = by_id.get(&hit.id) else {
                 continue;
             };
- 
+
             if memory.importance < query.min_importance {
                 continue;
             }
@@ -306,12 +309,12 @@ impl MemoryEngine {
                     continue;
                 }
             }
- 
+
             let days_since_access = (now - memory.last_accessed).num_seconds() as f64 / 86400.0;
             let recency = crate::ranking::recency_factor(days_since_access, memory.memory_type);
             let reinforcement = crate::ranking::reinforcement_factor(memory.access_count);
             let confidence_weight = memory.confidence.weight();
- 
+
             // M7: stale-only filter. A memory is "stale" once it has gone
             // twice its type's decay half-life without being touched. This
             // must reuse ranking::decay_half_life_days rather than invent a
@@ -324,7 +327,7 @@ impl MemoryEngine {
                     continue;
                 }
             }
- 
+
             let score = crate::ranking::final_score(
                 hit.score,
                 memory.importance,
@@ -332,25 +335,25 @@ impl MemoryEngine {
                 reinforcement,
                 confidence_weight,
             );
- 
+
             scored.push(RecallItem {
                 memory: memory.clone(),
                 similarity: hit.score,
                 score,
             });
         }
- 
+
         scored.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| a.memory.id.cmp(&b.memory.id))
         });
         scored.truncate(query.limit);
- 
+
         if scored.is_empty() {
             return Ok(RecallResult { items: Vec::new() });
         }
- 
+
         let bumped_ids: Vec<Uuid> = scored.iter().map(|i| i.memory.id).collect();
         {
             let mut conn = self
@@ -359,7 +362,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             let tx = conn.transaction()?;
             let now_ts = now.timestamp();
- 
+
             let id_placeholders = (0..bumped_ids.len())
                 .map(|i| format!("?{}", i + 2))
                 .collect::<Vec<_>>()
@@ -374,7 +377,7 @@ impl MemoryEngine {
                  WHERE id IN ({id_placeholders})",
                 threshold = ConfidenceLevel::PROMOTION_THRESHOLD,
             );
- 
+
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_ts)];
             for id in &bumped_ids {
                 params_vec.push(Box::new(id.to_string()));
@@ -384,7 +387,7 @@ impl MemoryEngine {
             tx.execute(&sql, params_refs.as_slice())?;
             tx.commit()?;
         }
- 
+
         let refetched = {
             let conn = self
                 .conn
@@ -397,32 +400,32 @@ impl MemoryEngine {
                 item.memory = m.clone();
             }
         }
- 
+
         Ok(RecallResult { items: scored })
     }
- 
+
     pub async fn get(&self, id: &str) -> Result<Option<Memory>> {
         let uuid = Uuid::parse_str(id)?;
- 
+
         let conn = self
             .conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
- 
+
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1");
         let memory = conn
             .query_row(&sql, params![uuid.to_string()], row_to_memory)
             .optional()?;
- 
+
         Ok(memory)
     }
- 
+
     pub async fn get_embedding(&self, memory_id: &str) -> Result<Option<Vec<f32>>> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
- 
+
         let row: Option<(Vec<u8>, i64)> = conn
             .query_row(
                 "SELECT vector, dimension FROM embeddings WHERE memory_id = ?1",
@@ -431,34 +434,34 @@ impl MemoryEngine {
             )
             .optional()?;
         drop(conn);
- 
+
         let Some((blob, stored_dim)) = row else {
             return Ok(None);
         };
- 
+
         let vector: Vec<f32> = bincode::deserialize(&blob)
             .map_err(|e| MemoliteError::EmbeddingDecode(e.to_string()))?;
- 
+
         if vector.len() != stored_dim as usize {
             return Err(MemoliteError::Corruption(format!(
                 "embedding for {memory_id} has {} floats but its row says dimension {stored_dim}",
                 vector.len()
             )));
         }
- 
+
         Ok(Some(vector))
     }
- 
+
     pub fn dimension(&self) -> usize {
         self.embedder
             .lock()
             .expect("embedder mutex poisoned")
             .dimension()
     }
- 
+
     pub async fn forget(&self, id: &str) -> Result<()> {
         let uuid = Uuid::parse_str(id)?;
- 
+
         {
             let conn = self
                 .conn
@@ -466,7 +469,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
             conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         }
- 
+
         let store = {
             let guard = self
                 .vector_store
@@ -474,7 +477,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
- 
+
         if let Err(e) = store.delete(uuid).await {
             if let Err(reconcile_err) =
                 reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
@@ -486,24 +489,24 @@ impl MemoryEngine {
             }
             return Err(e);
         }
- 
+
         Ok(())
     }
- 
+
     pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
         let uuid = Uuid::parse_str(id)?;
         let old = self
             .get(id)
             .await?
             .ok_or_else(|| MemoliteError::NotFound(id.to_string()))?;
- 
+
         if old.superseded_by.is_some() {
             return Err(MemoliteError::InvalidArgument(format!(
                 "memory {id} has already been superseded and cannot be updated directly; \
                  update the memory it was superseded by instead"
             )));
         }
- 
+
         let now = Utc::now();
         let is_expired = old.expires_at.map(|e| e <= now).unwrap_or(false);
         if is_expired && update.new_expiry.is_none() {
@@ -511,7 +514,7 @@ impl MemoryEngine {
                 "memory is expired; supply new_expiry explicitly to revive it".into(),
             ));
         }
- 
+
         let mut request = StoreRequest::new(
             &update.new_content.unwrap_or_else(|| old.content.clone()),
             update.new_memory_type.unwrap_or(old.memory_type),
@@ -525,9 +528,9 @@ impl MemoryEngine {
         });
         request.metadata = update.new_metadata.unwrap_or_else(|| old.metadata.clone());
         request.confidence = update.new_confidence.unwrap_or(ConfidenceLevel::Inferred);
- 
+
         let new_uuid = self.store_with_options_id(request).await?;
- 
+
         if let Err(e) = self.mark_superseded(&uuid, &new_uuid.to_string()) {
             let del_err = {
                 let conn = self
@@ -551,7 +554,7 @@ impl MemoryEngine {
                 Arc::clone(&*guard)
             };
             let vec_err = store.delete(new_uuid).await.err();
- 
+
             if del_err.is_some() || vec_err.is_some() {
                 return Err(MemoliteError::CompensationFailed {
                     operation: e.to_string(),
@@ -560,28 +563,28 @@ impl MemoryEngine {
             }
             return Err(e);
         }
- 
+
         Ok(new_uuid.to_string())
     }
- 
+
     fn mark_superseded(&self, old_id: &Uuid, new_id: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
- 
+
         let affected = conn.execute(
             "UPDATE memories SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL",
             params![new_id, old_id.to_string()],
         )?;
- 
+
         if affected == 0 {
             let exists: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
                 params![old_id.to_string()],
                 |r| r.get(0),
             )?;
- 
+
             if exists {
                 return Err(MemoliteError::InvalidArgument(format!(
                     "memory {old_id} was already superseded by another update (concurrent update race)"
@@ -589,33 +592,33 @@ impl MemoryEngine {
             }
             return Err(MemoliteError::NotFound(old_id.to_string()));
         }
- 
+
         Ok(())
     }
- 
+
     pub async fn purge_expired(&self) -> Result<usize> {
         let now = Utc::now().timestamp();
- 
+
         let deleted_ids: Vec<String> = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
- 
+
             let mut stmt = conn.prepare(
                 "DELETE FROM memories
                  WHERE expires_at IS NOT NULL AND expires_at <= ?1
                  RETURNING id",
             )?;
- 
+
             stmt.query_map(params![now], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
- 
+
         if deleted_ids.is_empty() {
             return Ok(0);
         }
- 
+
         let store = {
             let guard = self
                 .vector_store
@@ -623,9 +626,9 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             Arc::clone(&*guard)
         };
- 
+
         let mut vector_errors = Vec::new();
- 
+
         for id in &deleted_ids {
             if let Ok(uuid) = Uuid::parse_str(id) {
                 if let Err(error) = store.delete(uuid).await {
@@ -633,7 +636,7 @@ impl MemoryEngine {
                 }
             }
         }
- 
+
         if !vector_errors.is_empty() {
             let combined = vector_errors.join("; ");
             if let Err(reconcile_error) =
@@ -646,10 +649,77 @@ impl MemoryEngine {
             }
             return Err(MemoliteError::VectorStore(combined));
         }
- 
+
         Ok(deleted_ids.len())
     }
- 
+
+    // ---------------------------------------------------------------
+    // M10 — background maintenance controller
+    //
+    // A single background task that runs `purge_expired` and
+    // `compress_old_memories` on independent intervals until cancelled.
+    // `maintenance_running` (already a field on this struct) guarantees at
+    // most one such task is active per engine at a time.
+    // ---------------------------------------------------------------
+
+    /// Starts a background maintenance loop that periodically purges
+    /// expired memories and compresses old episodic clutter, on the
+    /// intervals given in `config`.
+    ///
+    /// Requires `self` behind an `Arc` because the spawned task holds only
+    /// a `Weak` reference to the engine — the loop will exit cleanly on its
+    /// own once every `Arc<MemoryEngine>` the caller holds is dropped,
+    /// rather than keeping an otherwise-unused engine alive forever.
+    ///
+    /// Returns `Err(InvalidArgument)` if either configured interval is
+    /// zero, and `Err(InvalidArgument)` if maintenance is already running
+    /// on this engine (call `MaintenanceHandle::shutdown` first to stop the
+    /// existing loop before starting a new one).
+    pub fn start_maintenance(
+        self: &Arc<Self>,
+        config: MaintenanceConfig,
+    ) -> Result<MaintenanceHandle> {
+        validate_config(&config)?;
+
+        if self.maintenance_running.swap(true, Ordering::SeqCst) {
+            return Err(MemoliteError::InvalidArgument(
+                "maintenance is already running on this engine".into(),
+            ));
+        }
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let weak = Arc::downgrade(self);
+        let running_flag = Arc::clone(&self.maintenance_running);
+        let running_flag_for_task = Arc::clone(&running_flag);
+
+        let join = tokio::spawn(async move {
+            let (mut purge_tick, mut compress_tick) = build_intervals(&config);
+
+            loop {
+                tokio::select! {
+                    _ = cancel_for_task.cancelled() => break,
+                    _ = purge_tick.tick() => {
+                        let Some(engine) = weak.upgrade() else { break };
+                        if let Err(e) = engine.purge_expired().await {
+                            tracing::warn!(error = %e, "background purge failed; continuing");
+                        }
+                    }
+                    _ = compress_tick.tick() => {
+                        let Some(engine) = weak.upgrade() else { break };
+                        if let Err(e) = engine.compress_old_memories().await {
+                            tracing::warn!(error = %e, "background compression failed; continuing");
+                        }
+                    }
+                }
+            }
+
+            running_flag_for_task.store(false, Ordering::SeqCst);
+        });
+
+        Ok(spawn_maintenance_task(cancel, join, running_flag))
+    }
+
     // ---------------------------------------------------------------
     // M7 — temporal querying
     //
@@ -661,7 +731,7 @@ impl MemoryEngine {
     // `recall_query`) are the semantic-search-facing equivalent of the
     // same concepts.
     // ---------------------------------------------------------------
- 
+
     /// Every memory created within `[start, end]`, inclusive, ordered by
     /// creation time ascending. A pure SQLite range scan — does not touch
     /// the embedder or vector store.
@@ -675,7 +745,7 @@ impl MemoryEngine {
                 "start must not be after end".into(),
             ));
         }
- 
+
         let conn = self
             .conn
             .lock()
@@ -689,7 +759,7 @@ impl MemoryEngine {
         let rows = stmt.query_map(params![start.timestamp(), end.timestamp()], row_to_memory)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
- 
+
     /// Every memory *created or accessed* since `since`, most recent
     /// creation first.
     ///
@@ -714,7 +784,7 @@ impl MemoryEngine {
         let rows = stmt.query_map(params![since.timestamp()], row_to_memory)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
- 
+
     /// Every *active* memory (not superseded, not expired) that hasn't
     /// been accessed in at least twice its type's decay half-life.
     ///
@@ -734,7 +804,7 @@ impl MemoryEngine {
             })
             .collect())
     }
- 
+
     /// Not-superseded, not-(already-)expired memories. Synchronous SQLite
     /// helper shared by `find_stale_memories`; kept private since it's an
     /// implementation detail of "what counts as active", not a public
@@ -753,7 +823,7 @@ impl MemoryEngine {
         let rows = stmt.query_map(params![now], row_to_memory)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
- 
+
     /// Walks a memory's `superseded_by` chain forward from `id` to its
     /// current version, inclusive of both ends. `id` may be any memory in
     /// the chain, not just the original.
@@ -770,7 +840,7 @@ impl MemoryEngine {
             .await?
             .ok_or_else(|| MemoliteError::NotFound(id.to_string()))?;
         chain.push(current.clone());
- 
+
         let mut guard_iterations = 0usize;
         while let Some(next_id) = current.superseded_by {
             guard_iterations += 1;
@@ -787,7 +857,7 @@ impl MemoryEngine {
         }
         Ok(chain)
     }
- 
+
     // ---------------------------------------------------------------
     // M9 — compression + index rebuild
     //
@@ -796,7 +866,7 @@ impl MemoryEngine {
     // synchronous SQLite helpers or a one-line delegation into
     // `reconcile_vector_index` (Step 0.8 / the top of this file).
     // ---------------------------------------------------------------
- 
+
     /// All episodic memories with `created_at <= now - days`. A pure
     /// SQLite range scan, reused by `compress_old_memories` as the first,
     /// cheap filter before the more expensive eligibility/embedding checks.
@@ -812,7 +882,7 @@ impl MemoryEngine {
         let rows = stmt.query_map(params![cutoff], row_to_memory)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
- 
+
     /// Resynchronizes the entire vector index from SQLite via
     /// `BackfillPolicy::ReplaceAll`. Useful for manual recovery if the
     /// vector store is ever suspected to have drifted from SQLite (e.g.
@@ -827,7 +897,7 @@ impl MemoryEngine {
         };
         reconcile_vector_index(&self.conn, &store, BackfillPolicy::ReplaceAll).await
     }
- 
+
     /// Consolidates old, low-importance episodic memories into semantic
     /// summaries.
     ///
@@ -837,7 +907,7 @@ impl MemoryEngine {
     /// always writes memory + embedding in one transaction) — a missing
     /// embedding is treated as `Err(Corruption)`, never silently skipped.
     ///
-    /// Candidates are clustered by cosine similarity (threshold `0.85`);
+    /// Candidates are clustered by cosine similarity (threshold `0.62`);
     /// any cluster with 3+ members is summarized (extractively) into one
     /// new `Semantic`/`Inferred` memory, and every original in that
     /// cluster is marked `superseded_by` the new summary — recoverable via
@@ -851,11 +921,11 @@ impl MemoryEngine {
             .into_iter()
             .filter(compression::is_compression_eligible)
             .collect();
- 
+
         if candidates.is_empty() {
             return Ok(0);
         }
- 
+
         let expected_dim = {
             let guard = self
                 .vector_store
@@ -863,7 +933,7 @@ impl MemoryEngine {
                 .map_err(|_| MemoliteError::Internal("vector-store lock poisoned".into()))?;
             guard.dimension()
         };
- 
+
         let mut with_vectors: Vec<(Uuid, Vec<f32>)> = Vec::with_capacity(candidates.len());
         for m in &candidates {
             // A candidate came straight out of `memories`, which — per
@@ -880,22 +950,22 @@ impl MemoryEngine {
             validate_vector(&format!("embedding for {}", m.id), &vector, expected_dim)?;
             with_vectors.push((m.id, vector));
         }
- 
-        let clusters = compression::greedy_cluster(&with_vectors, 0.85);
+
+        let clusters = compression::greedy_cluster(&with_vectors, 0.62);
         let mut compressed_count = 0usize;
- 
+
         for cluster in clusters.into_iter().filter(|c| c.member_ids.len() >= 3) {
             let members: Vec<Memory> = candidates
                 .iter()
                 .filter(|m| cluster.member_ids.contains(&m.id))
                 .cloned()
                 .collect();
- 
+
             let CompressionResult {
                 summary_content,
                 original_ids,
-            } = compression::summarize_cluster(&members, 0.85)?;
- 
+            } = compression::summarize_cluster(&members, 0.62)?;
+
             let mut metadata = HashMap::new();
             metadata.insert(
                 "compression.original_ids".to_string(),
@@ -905,13 +975,13 @@ impl MemoryEngine {
                 "compression.algorithm_version".to_string(),
                 serde_json::json!(compression::COMPRESSION_ALGORITHM_VERSION),
             );
- 
+
             let mut request = StoreRequest::new(&summary_content, MemoryType::Semantic, 0.3)
                 .with_confidence(ConfidenceLevel::Inferred);
             request.metadata = metadata;
- 
+
             let new_uuid = self.store_with_options_id(request).await?;
- 
+
             if let Err(e) = self.mark_all_superseded(&original_ids, &new_uuid.to_string()) {
                 // Best-effort compensation: try to remove the just-created
                 // summary from both SQLite and the vector store so the
@@ -940,16 +1010,16 @@ impl MemoryEngine {
                     Arc::clone(&*guard)
                 };
                 let _ = store.delete(new_uuid).await;
- 
+
                 return Err(e);
             }
- 
+
             compressed_count += members.len();
         }
- 
+
         Ok(compressed_count)
     }
- 
+
     /// Marks every id in `old_ids` as `superseded_by` in `new_id`, all in
     /// one SQLite transaction — mirrors `mark_superseded` (M5), just over
     /// a batch of ids instead of one.
@@ -968,36 +1038,139 @@ impl MemoryEngine {
         tx.commit()?;
         Ok(())
     }
+
+    // ---------------------------------------------------------------
+    // M9.5 — observability
+    //
+    // A single read-only method that reports aggregate counts/averages
+    // over the `memories` table. It never touches the embedder or the
+    // vector store, and never mutates SQLite — it exists purely so a
+    // caller (or an ops dashboard) can answer "what's in this database
+    // right now" without having to page through every row via `recall()`
+    // or `query_by_time_range()`.
+    // ---------------------------------------------------------------
+
+    /// Returns aggregate statistics about the memories stored in the
+    /// engine. This is a read-only operation that does not modify any
+    /// data. All counts are computed at the moment of call from the
+    /// SQLite database, so two calls in a row may legitimately differ if
+    /// the database changed in between (e.g. `expired_count` grows as
+    /// wall-clock time passes, independent of any write).
+    pub async fn stats(&self) -> Result<crate::stats::MemoryStats> {
+        let now = Utc::now().timestamp();
+
+        // Acquire the database lock. It is released when `conn` goes out
+        // of scope at the end of this function — this method has no
+        // `.await` points after the lock is taken, so there is no risk of
+        // holding it across an await.
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
+
+        // Simple scalar counts.
+        let total_memories: usize = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)?;
+
+        let superseded_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)?;
+
+        let expired_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
+                params![now],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)?;
+
+        // Grouped counts by type and confidence.
+        let mut by_type = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT type, COUNT(*) FROM memories GROUP BY type")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows {
+                let (t, c) = row?;
+                by_type.insert(t, c);
+            }
+        }
+
+        let mut by_confidence = HashMap::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT confidence, COUNT(*) FROM memories GROUP BY confidence")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?;
+            for row in rows {
+                let (c, n) = row?;
+                by_confidence.insert(c, n);
+            }
+        }
+
+        // Averages: handle the empty-table case safely — SQLite's AVG()
+        // over zero rows returns NULL, which we treat as 0.0 rather than
+        // querying it and dealing with an Option<f64>.
+        let (average_importance, average_access_count) = if total_memories == 0 {
+            (0.0_f32, 0.0_f32)
+        } else {
+            let avg_imp: f64 =
+                conn.query_row("SELECT AVG(importance) FROM memories", [], |r| r.get(0))?;
+            let avg_acc: f64 = conn.query_row(
+                "SELECT AVG(access_count) FROM memories",
+                [],
+                |r| r.get(0),
+            )?;
+            (avg_imp as f32, avg_acc as f32)
+        };
+
+        Ok(crate::stats::MemoryStats {
+            total_memories,
+            by_type,
+            by_confidence,
+            superseded_count,
+            expired_count,
+            average_importance,
+            average_access_count,
+        })
+    }
 }
- 
+
 fn fetch_memories_by_ids(conn: &Connection, ids: &[Uuid]) -> Result<HashMap<Uuid, Memory>> {
     let mut result = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
         return Ok(result);
     }
- 
+
     let id_placeholders = (0..ids.len())
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({id_placeholders})");
- 
+
     let params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
         .iter()
         .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::ToSql>)
         .collect();
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
- 
+
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_refs.as_slice(), row_to_memory)?;
     for row in rows {
         let memory = row?;
         result.insert(memory.id, memory);
     }
- 
+
     Ok(result)
 }
- 
+
 async fn reconcile_vector_index(
     conn: &Mutex<Connection>,
     store: &Arc<dyn VectorStore>,
@@ -1006,14 +1179,14 @@ async fn reconcile_vector_index(
     if policy == BackfillPolicy::ExistingOnly {
         return Ok(());
     }
- 
+
     let now = Utc::now().timestamp();
- 
+
     let entries: Vec<VectorEntry> = {
         let conn = conn
             .lock()
             .map_err(|_| MemoliteError::Internal("database mutex poisoned".into()))?;
- 
+
         let mut stmt = conn.prepare(
             "SELECT m.id, e.vector, e.dimension, m.metadata
              FROM memories m LEFT JOIN embeddings e ON e.memory_id = m.id
@@ -1028,18 +1201,18 @@ async fn reconcile_vector_index(
                 row.get::<_, String>(3)?,
             ))
         })?;
- 
+
         let mut out = Vec::new();
         for row in rows {
             let (id_str, bytes, stored_dim, metadata_json) = row?;
             let id = Uuid::parse_str(&id_str)?;
- 
+
             let (Some(bytes), Some(stored_dim)) = (bytes, stored_dim) else {
                 return Err(MemoliteError::Corruption(format!(
                     "memory {id} has no matching embedding row"
                 )));
             };
- 
+
             let vector: Vec<f32> = bincode::deserialize(&bytes)
                 .map_err(|e| MemoliteError::EmbeddingDecode(e.to_string()))?;
             if vector.len() != stored_dim as usize {
@@ -1049,7 +1222,7 @@ async fn reconcile_vector_index(
                     stored_dim
                 )));
             }
- 
+
             let metadata: HashMap<String, serde_json::Value> =
                 serde_json::from_str(&metadata_json)?;
             out.push(VectorEntry {
@@ -1060,7 +1233,7 @@ async fn reconcile_vector_index(
         }
         out
     };
- 
+
     match policy {
         BackfillPolicy::ExistingOnly => unreachable!("handled by the early return above"),
         BackfillPolicy::UpsertLocal => {
@@ -1072,46 +1245,46 @@ async fn reconcile_vector_index(
         BackfillPolicy::ReplaceAll => store.replace_all(entries).await,
     }
 }
- 
+
 fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| to_sql_conversion_err(0, e))?;
- 
+
     let content: String = row.get(1)?;
- 
+
     let type_str: String = row.get(2)?;
     let memory_type = MemoryType::parse_str(&type_str).map_err(|e| to_sql_conversion_err(2, e))?;
- 
+
     let importance: f32 = row.get(3)?;
- 
+
     let access_count: i64 = row.get(4)?;
     let access_count = access_count as u32;
- 
+
     let created_at_ts: i64 = row.get(5)?;
     let created_at = timestamp_to_datetime(created_at_ts, 5)?;
- 
+
     let last_accessed_ts: i64 = row.get(6)?;
     let last_accessed = timestamp_to_datetime(last_accessed_ts, 6)?;
- 
+
     let expires_at_ts: Option<i64> = row.get(7)?;
     let expires_at = expires_at_ts
         .map(|ts| timestamp_to_datetime(ts, 7))
         .transpose()?;
- 
+
     let superseded_by_str: Option<String> = row.get(8)?;
     let superseded_by = superseded_by_str
         .map(|s| Uuid::parse_str(&s))
         .transpose()
         .map_err(|e| to_sql_conversion_err(8, e))?;
- 
+
     let metadata_str: String = row.get(9)?;
     let metadata: HashMap<String, serde_json::Value> =
         serde_json::from_str(&metadata_str).map_err(|e| to_sql_conversion_err(9, e))?;
- 
+
     let confidence_str: String = row.get(10)?;
     let confidence =
         ConfidenceLevel::parse_str(&confidence_str).map_err(|e| to_sql_conversion_err(10, e))?;
- 
+
     Ok(Memory {
         id,
         content,
@@ -1126,14 +1299,14 @@ fn row_to_memory(row: &Row) -> rusqlite::Result<Memory> {
         confidence,
     })
 }
- 
+
 fn to_sql_conversion_err<E>(col: usize, err: E) -> rusqlite::Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(err))
 }
- 
+
 fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>> {
     Utc.timestamp_opt(ts, 0).single().ok_or_else(|| {
         to_sql_conversion_err(
@@ -1142,15 +1315,7 @@ fn timestamp_to_datetime(ts: i64, col: usize) -> rusqlite::Result<DateTime<Utc>>
         )
     })
 }
-// ---------------------------------------------------------------------
-// Paste everything below directly under the bottom of engine.rs
-// (after the MemoryEngine impl block and any other production code).
-//
-// Contains two sibling test modules:
-//   - `tests`        : core engine tests, with a nested `m7_tests`
-//                       submodule (time-range / staleness / superseded
-//                       chain queries).
-//   - `compression_tests` : memory-compression / consolidation tests.
+
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2853,7 +3018,7 @@ async fn rebuild_vector_index_prunes_superseded_originals_but_keeps_summary_sear
     // Near-templated sentences (identical structure, a single word
     // swapped) -- mirrors the login-timeout fixture in
     // `compress_old_memories_folds_similar_old_episodic_memories_into_one_summary`,
-    // which is the pattern that reliably clears the 0.85 cosine
+    // which is the pattern that reliably clears the 0.62 cosine
     // threshold under a real sentence-embedding model. Looser
     // paraphrases ("prefers dark mode" / "likes dark themes" /
     // "prefers a dark color theme") are semantically equivalent to a
@@ -3006,4 +3171,270 @@ async fn rebuild_vector_index_prunes_superseded_originals_but_keeps_summary_sear
             assert_eq!(mem.superseded_by.unwrap().to_string(), new_id);
         }
     }
+mod stats_tests {
+    use super::*;
+ 
+    /// Opens a fresh, file-less engine for a single test. Every test gets
+    /// its own isolated in-memory SQLite database and vector store, so
+    /// tests never interfere with each other's counts.
+    async fn open_test_engine() -> MemoryEngine {
+        MemoryEngine::open(":memory:")
+            .await
+            .expect("failed to open in-memory test engine")
+    }
+ 
+    #[tokio::test]
+    async fn stats_on_empty_engine_are_all_zero() {
+        let engine = open_test_engine().await;
+ 
+        let stats = engine
+            .stats()
+            .await
+            .expect("stats() should succeed on an empty database");
+ 
+        assert_eq!(stats.total_memories, 0);
+        assert!(stats.by_type.is_empty());
+        assert!(stats.by_confidence.is_empty());
+        assert_eq!(stats.superseded_count, 0);
+        assert_eq!(stats.expired_count, 0);
+        // AVG() over zero rows is NULL in SQLite; stats() must treat that
+        // as 0.0 rather than erroring or panicking on a NULL-to-f64 read.
+        assert_eq!(stats.average_importance, 0.0);
+        assert_eq!(stats.average_access_count, 0.0);
+    }
+ 
+    #[tokio::test]
+    async fn stats_total_count_matches_number_of_stored_memories() {
+        let engine = open_test_engine().await;
+ 
+        engine
+            .store("fact one", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("fact two", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("fact three", MemoryType::Procedural, 0.5)
+            .await
+            .unwrap();
+ 
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 3);
+    }
+ 
+    #[tokio::test]
+    async fn stats_by_type_groups_correctly() {
+        let engine = open_test_engine().await;
+ 
+        engine
+            .store("a semantic fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("another semantic fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("an episodic event", MemoryType::Episodic, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("a procedure", MemoryType::Procedural, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("a working note", MemoryType::Working, 0.5)
+            .await
+            .unwrap();
+ 
+        let stats = engine.stats().await.unwrap();
+ 
+        assert_eq!(stats.by_type.get("semantic"), Some(&2));
+        assert_eq!(stats.by_type.get("episodic"), Some(&1));
+        assert_eq!(stats.by_type.get("procedural"), Some(&1));
+        assert_eq!(stats.by_type.get("working"), Some(&1));
+        assert_eq!(stats.total_memories, 5);
+    }
+ 
+    #[tokio::test]
+    async fn stats_by_confidence_groups_correctly() {
+        let engine = open_test_engine().await;
+ 
+        // Default confidence for `store()` / a bare `StoreRequest::new(...)`
+        // is Explicit.
+        engine
+            .store("stated directly by the user", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let inferred_request =
+            StoreRequest::new("guessed from context", MemoryType::Semantic, 0.5)
+                .with_confidence(ConfidenceLevel::Inferred);
+        engine.store_with_options(inferred_request).await.unwrap();
+ 
+        let reinforced_request =
+            StoreRequest::new("repeatedly confirmed", MemoryType::Semantic, 0.5)
+                .with_confidence(ConfidenceLevel::Reinforced);
+        engine
+            .store_with_options(reinforced_request)
+            .await
+            .unwrap();
+ 
+        let stats = engine.stats().await.unwrap();
+ 
+        assert_eq!(stats.by_confidence.get("explicit"), Some(&1));
+        assert_eq!(stats.by_confidence.get("inferred"), Some(&1));
+        assert_eq!(stats.by_confidence.get("reinforced"), Some(&1));
+        assert_eq!(stats.total_memories, 3);
+    }
+ 
+    #[tokio::test]
+    async fn stats_average_importance_is_computed_correctly() {
+        let engine = open_test_engine().await;
+ 
+        engine
+            .store("low importance", MemoryType::Semantic, 0.2)
+            .await
+            .unwrap();
+        engine
+            .store("high importance", MemoryType::Semantic, 0.8)
+            .await
+            .unwrap();
+ 
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 2);
+        assert!((stats.average_importance - 0.5).abs() < 1e-5);
+        // Neither memory has been recalled yet, so access_count is 0 for both.
+        assert_eq!(stats.average_access_count, 0.0);
+    }
+ 
+    #[tokio::test]
+    async fn stats_average_access_count_reflects_recall_bumps() {
+        let engine = open_test_engine().await;
+ 
+        engine
+            .store("the user prefers dark mode", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+        engine
+            .store("totally unrelated content", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let before = engine.stats().await.unwrap();
+        assert_eq!(before.average_access_count, 0.0);
+ 
+        // recall() bumps access_count on whatever it returns.
+        engine.recall("dark mode preference").await.unwrap();
+ 
+        let after = engine.stats().await.unwrap();
+        assert!(after.average_access_count > before.average_access_count);
+    }
+ 
+    #[tokio::test]
+    async fn stats_superseded_count_reflects_update() {
+        let engine = open_test_engine().await;
+ 
+        let id = engine
+            .store("the user uses vs code", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let stats_before = engine.stats().await.unwrap();
+        assert_eq!(stats_before.superseded_count, 0);
+        assert_eq!(stats_before.total_memories, 1);
+ 
+        engine
+            .update(
+                &id,
+                MemoryUpdate {
+                    new_content: Some("the user now uses zed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+ 
+        let stats_after = engine.stats().await.unwrap();
+        // The original memory is now superseded by the replacement; the
+        // replacement itself is not superseded by anything yet, so only
+        // one of the two rows counts.
+        assert_eq!(stats_after.superseded_count, 1);
+        assert_eq!(stats_after.total_memories, 2);
+    }
+ 
+    #[tokio::test]
+    async fn stats_expired_count_reflects_past_expiry_without_deleting_rows() {
+        let engine = open_test_engine().await;
+ 
+        let id = engine
+            .store_with_options(
+                StoreRequest::new("a note that will be backdated", MemoryType::Working, 0.5)
+                    .expiry(ExpiryPolicy::Never),
+            )
+            .await
+            .unwrap();
+ 
+        // stats() must never mutate data, so this test backdates
+        // `expires_at` directly via raw SQL — reaching the private `conn`
+        // field, which this module can do because it is a descendant of
+        // `engine` — rather than going through `purge_expired()`, which
+        // would delete the row outright and defeat the point of the test
+        // (proving `expired_count` counts rows that are expired but not
+        // yet purged).
+        {
+            let conn = engine.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
+                params![Utc::now().timestamp() - 3600, id],
+            )
+            .unwrap();
+        }
+ 
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 1);
+        assert_eq!(stats.expired_count, 1);
+        // Expired is a distinct state from superseded — this row should
+        // not be double-counted as both.
+        assert_eq!(stats.superseded_count, 0);
+    }
+ 
+    #[tokio::test]
+    async fn stats_does_not_count_a_future_expiry_as_expired() {
+        let engine = open_test_engine().await;
+ 
+        engine
+            .store_with_options(
+                StoreRequest::new("expires far in the future", MemoryType::Semantic, 0.5)
+                    .expiry(ExpiryPolicy::Custom(chrono::Duration::days(365))),
+            )
+            .await
+            .unwrap();
+ 
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.total_memories, 1);
+        assert_eq!(stats.expired_count, 0);
+    }
+ 
+    #[tokio::test]
+    async fn stats_is_read_only_and_stable_across_repeated_calls() {
+        let engine = open_test_engine().await;
+        engine
+            .store("some fact", MemoryType::Semantic, 0.5)
+            .await
+            .unwrap();
+ 
+        let first = engine.stats().await.unwrap();
+        let second = engine.stats().await.unwrap();
+ 
+        assert_eq!(first.total_memories, second.total_memories);
+        assert_eq!(first.by_type, second.by_type);
+        assert_eq!(first.by_confidence, second.by_confidence);
+        assert_eq!(first.superseded_count, second.superseded_count);
+        assert_eq!(first.expired_count, second.expired_count);
+    }
+}
+    
 }
